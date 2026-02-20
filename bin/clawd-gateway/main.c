@@ -1,0 +1,1233 @@
+/*
+ * clawd-linux :: clawd-gateway
+ * main.c - Gateway server: HTTP API, WebSocket, and Unix socket interface
+ *
+ * Usage: clawd-gateway [options]
+ * Options:
+ *   -c, --config <path>   Config file
+ *   -l, --listen <addr>   Listen address (default: 127.0.0.1)
+ *   -p, --port <port>     Listen port (default: 3000)
+ *   -s, --socket <path>   Unix socket path
+ *   -d, --daemon          Daemonize
+ *   -h, --help            Help
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <clawd/clawd.h>
+#include <clawd/config.h>
+#include <clawd/paths.h>
+#include <clawd/http.h>
+#include <clawd/signals.h>
+#include <clawd/audit.h>
+
+#include <cjson/cJSON.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifdef __linux__
+#include <sys/epoll.h>
+#include <systemd/sd-daemon.h>
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/event.h>
+#endif
+
+#include <poll.h>
+
+#include <microhttpd.h>
+
+/* ---- Version ------------------------------------------------------------ */
+
+#define CLAWD_GATEWAY_VERSION "0.1.0"
+
+/* ---- Limits ------------------------------------------------------------- */
+
+#define MAX_SESSIONS          256
+#define MAX_POST_DATA         (16 * 1024 * 1024) /* 16 MiB */
+#define UNIX_BACKLOG          16
+#define UNIX_BUF_SIZE         65536
+#define THREAD_POOL_SIZE      8
+
+/* ---- Global state ------------------------------------------------------- */
+
+static clawd_config_t        g_cfg;
+static const char           *g_listen_addr   = "127.0.0.1";
+static int                   g_port          = 3000;
+static char                 *g_socket_path   = NULL;
+static bool                  g_daemonize     = false;
+static volatile sig_atomic_t g_shutdown      = 0;
+
+static struct MHD_Daemon    *g_httpd         = NULL;
+static int                   g_unix_fd       = -1;
+static char                  g_pidfile[512]  = {0};
+
+/* ---- Session tracking --------------------------------------------------- */
+
+typedef struct {
+    char     id[64];
+    time_t   created;
+    time_t   last_active;
+    bool     active;
+} gateway_session_t;
+
+static gateway_session_t g_sessions[MAX_SESSIONS];
+static pthread_mutex_t   g_sessions_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static gateway_session_t *session_create(void)
+{
+    pthread_mutex_lock(&g_sessions_lock);
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (!g_sessions[i].active) {
+            g_sessions[i].active = true;
+            g_sessions[i].created = time(NULL);
+            g_sessions[i].last_active = g_sessions[i].created;
+            snprintf(g_sessions[i].id, sizeof(g_sessions[i].id),
+                     "sess_%08x%08x",
+                     (unsigned)g_sessions[i].created, (unsigned)i);
+            pthread_mutex_unlock(&g_sessions_lock);
+            return &g_sessions[i];
+        }
+    }
+    pthread_mutex_unlock(&g_sessions_lock);
+    return NULL;
+}
+
+static int session_count_active(void)
+{
+    int count = 0;
+    pthread_mutex_lock(&g_sessions_lock);
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (g_sessions[i].active)
+            count++;
+    }
+    pthread_mutex_unlock(&g_sessions_lock);
+    return count;
+}
+
+/* ---- HTTP request context ----------------------------------------------- */
+
+typedef struct {
+    clawd_str_t post_data;
+    bool        too_large;
+} http_request_ctx_t;
+
+/* ---- Signal handling ---------------------------------------------------- */
+
+static void on_shutdown_signal(int signo, void *userdata)
+{
+    (void)userdata;
+    CLAWD_INFO("received signal %d, initiating shutdown", signo);
+    g_shutdown = 1;
+}
+
+/* ---- Helper: JSON error response ---------------------------------------- */
+
+static struct MHD_Response *json_error_response(int code, const char *message)
+{
+    cJSON *obj = cJSON_CreateObject();
+    cJSON *err = cJSON_AddObjectToObject(obj, "error");
+    cJSON_AddNumberToObject(err, "code", code);
+    cJSON_AddStringToObject(err, "message", message);
+    cJSON_AddStringToObject(obj, "type", "error");
+
+    char *body = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+
+    struct MHD_Response *resp = MHD_create_response_from_buffer(
+        strlen(body), body, MHD_RESPMEM_MUST_FREE);
+    MHD_add_response_header(resp, "Content-Type", "application/json");
+    return resp;
+}
+
+/* ---- Helper: JSON success response -------------------------------------- */
+
+static struct MHD_Response *json_success_response(cJSON *result)
+{
+    char *body = cJSON_PrintUnformatted(result);
+    struct MHD_Response *resp = MHD_create_response_from_buffer(
+        strlen(body), body, MHD_RESPMEM_MUST_FREE);
+    MHD_add_response_header(resp, "Content-Type", "application/json");
+    return resp;
+}
+
+/* ---- Route: POST /v1/chat/completions (OpenAI-compatible) --------------- */
+
+static enum MHD_Result handle_chat_completions(
+    struct MHD_Connection *conn, const char *post_data, size_t post_len)
+{
+    cJSON *req = cJSON_ParseWithLength(post_data, post_len);
+    if (!req) {
+        struct MHD_Response *resp = json_error_response(400, "invalid JSON");
+        enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_BAD_REQUEST, resp);
+        MHD_destroy_response(resp);
+        return ret;
+    }
+
+    const char *model = clawd_json_get_string(req, "model");
+    cJSON *messages = clawd_json_get_array(req, "messages");
+    bool stream = clawd_json_get_bool(req, "stream", false);
+    int max_tokens = clawd_json_get_int(req, "max_tokens", 4096);
+
+    if (!messages) {
+        cJSON_Delete(req);
+        struct MHD_Response *resp = json_error_response(400, "missing 'messages' array");
+        enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_BAD_REQUEST, resp);
+        MHD_destroy_response(resp);
+        return ret;
+    }
+
+    (void)model;
+    (void)stream;
+    (void)max_tokens;
+
+    CLAWD_INFO("chat/completions: model=%s, messages=%d, stream=%s",
+               model ? model : "(default)",
+               cJSON_GetArraySize(messages),
+               stream ? "true" : "false");
+
+    /* Build a response in OpenAI format. */
+    gateway_session_t *sess = session_create();
+
+    cJSON *resp_obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp_obj, "id",
+                            sess ? sess->id : "sess_unknown");
+    cJSON_AddStringToObject(resp_obj, "object", "chat.completion");
+    cJSON_AddNumberToObject(resp_obj, "created", (double)time(NULL));
+    cJSON_AddStringToObject(resp_obj, "model",
+                            model ? model : (g_cfg.model.default_model
+                                                 ? g_cfg.model.default_model
+                                                 : "claude-sonnet-4-20250514"));
+
+    cJSON *choices = cJSON_AddArrayToObject(resp_obj, "choices");
+    cJSON *choice = cJSON_CreateObject();
+    cJSON_AddNumberToObject(choice, "index", 0);
+
+    cJSON *message = cJSON_CreateObject();
+    cJSON_AddStringToObject(message, "role", "assistant");
+    /*
+     * TODO: This is the integration point where we would call into the
+     * agents library to generate an actual response.  For now we return
+     * a placeholder that confirms the gateway is operational.
+     */
+    cJSON_AddStringToObject(message, "content",
+                            "[clawd-gateway] Request received. "
+                            "Agent processing not yet connected.");
+    cJSON_AddItemToObject(choice, "message", message);
+    cJSON_AddStringToObject(choice, "finish_reason", "stop");
+    cJSON_AddItemToArray(choices, choice);
+
+    cJSON *usage = cJSON_AddObjectToObject(resp_obj, "usage");
+    cJSON_AddNumberToObject(usage, "prompt_tokens", 0);
+    cJSON_AddNumberToObject(usage, "completion_tokens", 0);
+    cJSON_AddNumberToObject(usage, "total_tokens", 0);
+
+    struct MHD_Response *resp = json_success_response(resp_obj);
+    cJSON_Delete(resp_obj);
+    cJSON_Delete(req);
+
+    enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
+    MHD_destroy_response(resp);
+    return ret;
+}
+
+/* ---- Route: POST /v1/messages (Anthropic-compatible) -------------------- */
+
+static enum MHD_Result handle_messages(
+    struct MHD_Connection *conn, const char *post_data, size_t post_len)
+{
+    cJSON *req = cJSON_ParseWithLength(post_data, post_len);
+    if (!req) {
+        struct MHD_Response *resp = json_error_response(400, "invalid JSON");
+        enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_BAD_REQUEST, resp);
+        MHD_destroy_response(resp);
+        return ret;
+    }
+
+    const char *model = clawd_json_get_string(req, "model");
+    int max_tokens = clawd_json_get_int(req, "max_tokens", 4096);
+    cJSON *messages = clawd_json_get_array(req, "messages");
+    bool stream = clawd_json_get_bool(req, "stream", false);
+
+    if (!messages) {
+        cJSON_Delete(req);
+        struct MHD_Response *resp = json_error_response(400, "missing 'messages' array");
+        enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_BAD_REQUEST, resp);
+        MHD_destroy_response(resp);
+        return ret;
+    }
+
+    (void)stream;
+
+    CLAWD_INFO("messages: model=%s, max_tokens=%d, messages=%d",
+               model ? model : "(default)", max_tokens,
+               cJSON_GetArraySize(messages));
+
+    gateway_session_t *sess = session_create();
+
+    /* Build an Anthropic-format response. */
+    cJSON *resp_obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp_obj, "id",
+                            sess ? sess->id : "msg_unknown");
+    cJSON_AddStringToObject(resp_obj, "type", "message");
+    cJSON_AddStringToObject(resp_obj, "role", "assistant");
+    cJSON_AddStringToObject(resp_obj, "model",
+                            model ? model : (g_cfg.model.default_model
+                                                 ? g_cfg.model.default_model
+                                                 : "claude-sonnet-4-20250514"));
+
+    cJSON *content = cJSON_AddArrayToObject(resp_obj, "content");
+    cJSON *block = cJSON_CreateObject();
+    cJSON_AddStringToObject(block, "type", "text");
+    cJSON_AddStringToObject(block, "text",
+                            "[clawd-gateway] Request received. "
+                            "Agent processing not yet connected.");
+    cJSON_AddItemToArray(content, block);
+
+    cJSON_AddStringToObject(resp_obj, "stop_reason", "end_turn");
+    cJSON_AddNullToObject(resp_obj, "stop_sequence");
+
+    cJSON *usage = cJSON_AddObjectToObject(resp_obj, "usage");
+    cJSON_AddNumberToObject(usage, "input_tokens", 0);
+    cJSON_AddNumberToObject(usage, "output_tokens", 0);
+
+    struct MHD_Response *resp = json_success_response(resp_obj);
+    cJSON_Delete(resp_obj);
+    cJSON_Delete(req);
+
+    enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
+    MHD_destroy_response(resp);
+    return ret;
+}
+
+/* ---- Route: GET /v1/health ---------------------------------------------- */
+
+static enum MHD_Result handle_health(struct MHD_Connection *conn)
+{
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "status", "ok");
+    cJSON_AddStringToObject(obj, "version", CLAWD_GATEWAY_VERSION);
+    cJSON_AddNumberToObject(obj, "uptime", 0); /* TODO: track uptime */
+    cJSON_AddNumberToObject(obj, "active_sessions",
+                            (double)session_count_active());
+
+    struct MHD_Response *resp = json_success_response(obj);
+    cJSON_Delete(obj);
+
+    enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
+    MHD_destroy_response(resp);
+    return ret;
+}
+
+/* ---- Route: GET /v1/config ---------------------------------------------- */
+
+static enum MHD_Result handle_config(struct MHD_Connection *conn)
+{
+    cJSON *obj = cJSON_CreateObject();
+
+    cJSON *gw = cJSON_AddObjectToObject(obj, "gateway");
+    cJSON_AddStringToObject(gw, "host",
+                            g_cfg.gateway.host ? g_cfg.gateway.host : g_listen_addr);
+    cJSON_AddNumberToObject(gw, "port", g_port);
+    cJSON_AddBoolToObject(gw, "tls_enabled", g_cfg.gateway.tls_enabled);
+
+    cJSON *mdl = cJSON_AddObjectToObject(obj, "model");
+    cJSON_AddStringToObject(mdl, "default_provider",
+                            g_cfg.model.default_provider
+                                ? g_cfg.model.default_provider : "anthropic");
+    cJSON_AddStringToObject(mdl, "default_model",
+                            g_cfg.model.default_model
+                                ? g_cfg.model.default_model : "(unset)");
+    cJSON_AddNumberToObject(mdl, "max_tokens", g_cfg.model.max_tokens);
+    cJSON_AddNumberToObject(mdl, "temperature", (double)g_cfg.model.temperature);
+
+    cJSON *sec = cJSON_AddObjectToObject(obj, "security");
+    cJSON_AddBoolToObject(sec, "sandbox_enabled", g_cfg.security.sandbox_enabled);
+
+    struct MHD_Response *resp = json_success_response(obj);
+    cJSON_Delete(obj);
+
+    enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
+    MHD_destroy_response(resp);
+    return ret;
+}
+
+/* ---- Route: POST /v1/agent/chat ----------------------------------------- */
+
+static enum MHD_Result handle_agent_chat(
+    struct MHD_Connection *conn, const char *post_data, size_t post_len)
+{
+    cJSON *req = cJSON_ParseWithLength(post_data, post_len);
+    if (!req) {
+        struct MHD_Response *resp = json_error_response(400, "invalid JSON");
+        enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_BAD_REQUEST, resp);
+        MHD_destroy_response(resp);
+        return ret;
+    }
+
+    const char *message = clawd_json_get_string(req, "message");
+    if (!message) {
+        cJSON_Delete(req);
+        struct MHD_Response *resp = json_error_response(400, "missing 'message' field");
+        enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_BAD_REQUEST, resp);
+        MHD_destroy_response(resp);
+        return ret;
+    }
+
+    const char *session_id = clawd_json_get_string(req, "session_id");
+    bool use_tools = clawd_json_get_bool(req, "use_tools", true);
+
+    (void)session_id;
+    (void)use_tools;
+
+    CLAWD_INFO("agent/chat: message_len=%zu, use_tools=%s",
+               strlen(message), use_tools ? "true" : "false");
+
+    /* TODO: Route to agent library for processing with tool use. */
+    cJSON *resp_obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp_obj, "role", "assistant");
+    cJSON_AddStringToObject(resp_obj, "content",
+                            "[clawd-gateway] Agent chat received. "
+                            "Tool-use routing not yet connected.");
+    cJSON_AddStringToObject(resp_obj, "stop_reason", "end_turn");
+
+    struct MHD_Response *resp = json_success_response(resp_obj);
+    cJSON_Delete(resp_obj);
+    cJSON_Delete(req);
+
+    enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
+    MHD_destroy_response(resp);
+    return ret;
+}
+
+/* ---- Route: GET /v1/sessions -------------------------------------------- */
+
+static enum MHD_Result handle_sessions(struct MHD_Connection *conn)
+{
+    cJSON *obj = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(obj, "sessions");
+
+    pthread_mutex_lock(&g_sessions_lock);
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (g_sessions[i].active) {
+            cJSON *s = cJSON_CreateObject();
+            cJSON_AddStringToObject(s, "id", g_sessions[i].id);
+            cJSON_AddNumberToObject(s, "created",
+                                    (double)g_sessions[i].created);
+            cJSON_AddNumberToObject(s, "last_active",
+                                    (double)g_sessions[i].last_active);
+            cJSON_AddItemToArray(arr, s);
+        }
+    }
+    pthread_mutex_unlock(&g_sessions_lock);
+
+    struct MHD_Response *resp = json_success_response(obj);
+    cJSON_Delete(obj);
+
+    enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
+    MHD_destroy_response(resp);
+    return ret;
+}
+
+/* ---- MHD request handler ------------------------------------------------ */
+
+static enum MHD_Result http_handler(
+    void *cls,
+    struct MHD_Connection *conn,
+    const char *url,
+    const char *method,
+    const char *version,
+    const char *upload_data,
+    size_t *upload_data_size,
+    void **con_cls)
+{
+    (void)cls;
+    (void)version;
+
+    /* First call: allocate per-connection context. */
+    if (*con_cls == NULL) {
+        http_request_ctx_t *ctx = calloc(1, sizeof(*ctx));
+        if (!ctx)
+            return MHD_NO;
+        ctx->post_data = clawd_str_new();
+        *con_cls = ctx;
+        return MHD_YES;
+    }
+
+    http_request_ctx_t *ctx = *con_cls;
+
+    /* Accumulate POST data. */
+    if (*upload_data_size > 0) {
+        if (ctx->post_data.len + *upload_data_size > MAX_POST_DATA) {
+            ctx->too_large = true;
+        } else {
+            clawd_str_append(&ctx->post_data, upload_data, *upload_data_size);
+        }
+        *upload_data_size = 0;
+        return MHD_YES;
+    }
+
+    /* All data received -- dispatch. */
+    CLAWD_DEBUG("HTTP %s %s (body=%zu bytes)", method, url, ctx->post_data.len);
+
+    if (ctx->too_large) {
+        struct MHD_Response *resp = json_error_response(
+            413, "request body too large");
+        enum MHD_Result ret = MHD_queue_response(
+            conn, MHD_HTTP_CONTENT_TOO_LARGE, resp);
+        MHD_destroy_response(resp);
+        return ret;
+    }
+
+    enum MHD_Result result;
+
+    /* Route: POST /v1/chat/completions */
+    if (strcmp(method, "POST") == 0 &&
+        strcmp(url, "/v1/chat/completions") == 0) {
+        result = handle_chat_completions(conn,
+                                         ctx->post_data.data,
+                                         ctx->post_data.len);
+    }
+    /* Route: POST /v1/messages */
+    else if (strcmp(method, "POST") == 0 &&
+             strcmp(url, "/v1/messages") == 0) {
+        result = handle_messages(conn,
+                                 ctx->post_data.data,
+                                 ctx->post_data.len);
+    }
+    /* Route: GET /v1/health */
+    else if (strcmp(method, "GET") == 0 &&
+             strcmp(url, "/v1/health") == 0) {
+        result = handle_health(conn);
+    }
+    /* Route: GET /v1/config */
+    else if (strcmp(method, "GET") == 0 &&
+             strcmp(url, "/v1/config") == 0) {
+        result = handle_config(conn);
+    }
+    /* Route: POST /v1/agent/chat */
+    else if (strcmp(method, "POST") == 0 &&
+             strcmp(url, "/v1/agent/chat") == 0) {
+        result = handle_agent_chat(conn,
+                                   ctx->post_data.data,
+                                   ctx->post_data.len);
+    }
+    /* Route: GET /v1/sessions */
+    else if (strcmp(method, "GET") == 0 &&
+             strcmp(url, "/v1/sessions") == 0) {
+        result = handle_sessions(conn);
+    }
+    /* 404 - Not Found */
+    else {
+        struct MHD_Response *resp = json_error_response(404, "not found");
+        result = MHD_queue_response(conn, MHD_HTTP_NOT_FOUND, resp);
+        MHD_destroy_response(resp);
+    }
+
+    return result;
+}
+
+/* ---- MHD connection completed callback ---------------------------------- */
+
+static void http_completed(void *cls, struct MHD_Connection *conn,
+                           void **con_cls,
+                           enum MHD_RequestTerminationCode toe)
+{
+    (void)cls;
+    (void)conn;
+    (void)toe;
+
+    http_request_ctx_t *ctx = *con_cls;
+    if (ctx) {
+        clawd_str_free(&ctx->post_data);
+        free(ctx);
+    }
+    *con_cls = NULL;
+}
+
+/* ---- Unix socket server ------------------------------------------------- */
+
+static int unix_socket_create(const char *path)
+{
+    /* Remove stale socket file. */
+    unlink(path);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        CLAWD_ERROR("socket(AF_UNIX): %s", strerror(errno));
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+
+    if (strlen(path) >= sizeof(addr.sun_path)) {
+        CLAWD_ERROR("socket path too long: %s", path);
+        close(fd);
+        return -1;
+    }
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        CLAWD_ERROR("bind(%s): %s", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    /* Set socket permissions: owner read/write only. */
+    chmod(path, 0600);
+
+    if (listen(fd, UNIX_BACKLOG) < 0) {
+        CLAWD_ERROR("listen(%s): %s", path, strerror(errno));
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+
+    /* Set non-blocking. */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    CLAWD_INFO("Unix socket listening on %s", path);
+    return fd;
+}
+
+/**
+ * Handle a single JSON-RPC request on a Unix domain socket client connection.
+ */
+static void unix_client_handle(int client_fd)
+{
+    char buf[UNIX_BUF_SIZE];
+    clawd_str_t request = clawd_str_new();
+
+    /* Read until newline or EOF. */
+    for (;;) {
+        ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
+        if (n <= 0)
+            break;
+        buf[n] = '\0';
+        clawd_str_append(&request, buf, (size_t)n);
+        if (request.len > 0 && request.data[request.len - 1] == '\n')
+            break;
+        if (request.len > MAX_POST_DATA)
+            break;
+    }
+
+    if (request.len == 0) {
+        clawd_str_free(&request);
+        return;
+    }
+
+    clawd_str_trim(&request);
+
+    /* Parse JSON-RPC request. */
+    cJSON *req = clawd_json_parse(request.data);
+    clawd_str_free(&request);
+
+    if (!req) {
+        const char *err = "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32700,"
+                          "\"message\":\"parse error\"},\"id\":null}\n";
+        write(client_fd, err, strlen(err));
+        return;
+    }
+
+    const char *method = clawd_json_get_string(req, "method");
+    int rpc_id = clawd_json_get_int(req, "id", 0);
+    cJSON *params = clawd_json_get_object(req, "params");
+
+    CLAWD_DEBUG("JSON-RPC: method=%s, id=%d", method ? method : "(null)", rpc_id);
+
+    /* Build response. */
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "jsonrpc", "2.0");
+    cJSON_AddNumberToObject(resp, "id", rpc_id);
+
+    if (!method) {
+        cJSON *err = cJSON_AddObjectToObject(resp, "error");
+        cJSON_AddNumberToObject(err, "code", -32600);
+        cJSON_AddStringToObject(err, "message", "invalid request: missing method");
+    } else if (strcmp(method, "chat.send") == 0) {
+        const char *message = params ? clawd_json_get_string(params, "message") : NULL;
+        if (!message) {
+            cJSON *err = cJSON_AddObjectToObject(resp, "error");
+            cJSON_AddNumberToObject(err, "code", -32602);
+            cJSON_AddStringToObject(err, "message", "missing 'message' parameter");
+        } else {
+            CLAWD_INFO("chat.send: len=%zu", strlen(message));
+
+            /* TODO: Route to agent library for actual processing. */
+            cJSON *result = cJSON_AddObjectToObject(resp, "result");
+            cJSON_AddStringToObject(result, "content",
+                                    "[clawd-gateway] Message received. "
+                                    "Agent processing not yet connected.");
+            cJSON_AddStringToObject(result, "role", "assistant");
+            cJSON_AddStringToObject(result, "stop_reason", "end_turn");
+        }
+    } else if (strcmp(method, "health") == 0) {
+        cJSON *result = cJSON_AddObjectToObject(resp, "result");
+        cJSON_AddStringToObject(result, "status", "ok");
+        cJSON_AddStringToObject(result, "version", CLAWD_GATEWAY_VERSION);
+        cJSON_AddNumberToObject(result, "active_sessions",
+                                (double)session_count_active());
+    } else if (strcmp(method, "config.get") == 0) {
+        const char *key = params ? clawd_json_get_string(params, "key") : NULL;
+        if (!key) {
+            cJSON *err = cJSON_AddObjectToObject(resp, "error");
+            cJSON_AddNumberToObject(err, "code", -32602);
+            cJSON_AddStringToObject(err, "message", "missing 'key' parameter");
+        } else {
+            const char *val = clawd_config_get_string(&g_cfg, key);
+            cJSON *result = cJSON_AddObjectToObject(resp, "result");
+            if (val)
+                cJSON_AddStringToObject(result, "value", val);
+            else
+                cJSON_AddNullToObject(result, "value");
+        }
+    } else if (strcmp(method, "sessions.list") == 0) {
+        cJSON *result = cJSON_AddObjectToObject(resp, "result");
+        cJSON *arr = cJSON_AddArrayToObject(result, "sessions");
+        pthread_mutex_lock(&g_sessions_lock);
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            if (g_sessions[i].active) {
+                cJSON *s = cJSON_CreateObject();
+                cJSON_AddStringToObject(s, "id", g_sessions[i].id);
+                cJSON_AddItemToArray(arr, s);
+            }
+        }
+        pthread_mutex_unlock(&g_sessions_lock);
+    } else {
+        cJSON *err = cJSON_AddObjectToObject(resp, "error");
+        cJSON_AddNumberToObject(err, "code", -32601);
+        cJSON_AddStringToObject(err, "message", "method not found");
+    }
+
+    char *resp_str = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    cJSON_Delete(req);
+
+    if (resp_str) {
+        size_t rlen = strlen(resp_str);
+        /* Append newline delimiter. */
+        char *sendbuf = malloc(rlen + 2);
+        if (sendbuf) {
+            memcpy(sendbuf, resp_str, rlen);
+            sendbuf[rlen]     = '\n';
+            sendbuf[rlen + 1] = '\0';
+
+            ssize_t written = 0;
+            ssize_t total = (ssize_t)(rlen + 1);
+            while (written < total) {
+                ssize_t n = write(client_fd, sendbuf + written,
+                                  (size_t)(total - written));
+                if (n <= 0)
+                    break;
+                written += n;
+            }
+            free(sendbuf);
+        }
+        free(resp_str);
+    }
+}
+
+/**
+ * Thread function for handling a Unix socket client.
+ */
+static void *unix_client_thread(void *arg)
+{
+    int client_fd = (int)(intptr_t)arg;
+    unix_client_handle(client_fd);
+    close(client_fd);
+    return NULL;
+}
+
+/* ---- PID file ----------------------------------------------------------- */
+
+static int pidfile_write(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        CLAWD_ERROR("cannot create pidfile %s: %s", path, strerror(errno));
+        return -1;
+    }
+    fprintf(f, "%d\n", getpid());
+    fclose(f);
+    return 0;
+}
+
+static void pidfile_remove(const char *path)
+{
+    if (path[0])
+        unlink(path);
+}
+
+/* ---- Daemonize ---------------------------------------------------------- */
+
+static int daemonize_process(void)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        CLAWD_ERROR("fork(): %s", strerror(errno));
+        return -1;
+    }
+    if (pid > 0)
+        _exit(0); /* Parent exits. */
+
+    /* Child: new session. */
+    if (setsid() < 0) {
+        CLAWD_ERROR("setsid(): %s", strerror(errno));
+        return -1;
+    }
+
+    /* Fork again to ensure we cannot acquire a controlling terminal. */
+    pid = fork();
+    if (pid < 0) {
+        CLAWD_ERROR("fork(): %s", strerror(errno));
+        return -1;
+    }
+    if (pid > 0)
+        _exit(0);
+
+    /* Redirect stdin/stdout/stderr to /dev/null. */
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+        dup2(devnull, STDIN_FILENO);
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        if (devnull > 2)
+            close(devnull);
+    }
+
+    /* Change working directory. */
+    if (chdir("/") != 0) {
+        /* Non-fatal. */
+    }
+
+    /* Reset file creation mask. */
+    umask(0027);
+
+    return 0;
+}
+
+/* ---- Main event loop ---------------------------------------------------- */
+
+static void event_loop(void)
+{
+    CLAWD_INFO("entering event loop");
+
+#ifdef __linux__
+    /* epoll-based loop. */
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        CLAWD_ERROR("epoll_create1: %s", strerror(errno));
+        return;
+    }
+
+    if (g_unix_fd >= 0) {
+        struct epoll_event ev = {
+            .events = EPOLLIN,
+            .data.fd = g_unix_fd
+        };
+        epoll_ctl(epfd, EPOLL_CTL_ADD, g_unix_fd, &ev);
+    }
+
+    while (!g_shutdown) {
+        struct epoll_event events[16];
+        int nfds = epoll_wait(epfd, events, 16, 500);
+        if (nfds < 0) {
+            if (errno == EINTR)
+                continue;
+            CLAWD_ERROR("epoll_wait: %s", strerror(errno));
+            break;
+        }
+
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.fd == g_unix_fd) {
+                /* Accept new Unix socket connection. */
+                struct sockaddr_un peer;
+                socklen_t peer_len = sizeof(peer);
+                int client = accept(g_unix_fd,
+                                    (struct sockaddr *)&peer, &peer_len);
+                if (client >= 0) {
+                    pthread_t tid;
+                    if (pthread_create(&tid, NULL, unix_client_thread,
+                                       (void *)(intptr_t)client) == 0) {
+                        pthread_detach(tid);
+                    } else {
+                        close(client);
+                    }
+                }
+            }
+        }
+    }
+
+    close(epfd);
+
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+    /* kqueue-based loop. */
+    int kq = kqueue();
+    if (kq < 0) {
+        CLAWD_ERROR("kqueue: %s", strerror(errno));
+        return;
+    }
+
+    if (g_unix_fd >= 0) {
+        struct kevent change;
+        EV_SET(&change, g_unix_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+        kevent(kq, &change, 1, NULL, 0, NULL);
+    }
+
+    while (!g_shutdown) {
+        struct timespec timeout = { .tv_sec = 0, .tv_nsec = 500000000 };
+        struct kevent events[16];
+        int nev = kevent(kq, NULL, 0, events, 16, &timeout);
+        if (nev < 0) {
+            if (errno == EINTR)
+                continue;
+            CLAWD_ERROR("kevent: %s", strerror(errno));
+            break;
+        }
+
+        for (int i = 0; i < nev; i++) {
+            if ((int)events[i].ident == g_unix_fd) {
+                struct sockaddr_un peer;
+                socklen_t peer_len = sizeof(peer);
+                int client = accept(g_unix_fd,
+                                    (struct sockaddr *)&peer, &peer_len);
+                if (client >= 0) {
+                    pthread_t tid;
+                    if (pthread_create(&tid, NULL, unix_client_thread,
+                                       (void *)(intptr_t)client) == 0) {
+                        pthread_detach(tid);
+                    } else {
+                        close(client);
+                    }
+                }
+            }
+        }
+    }
+
+    close(kq);
+
+#else
+    /* poll-based fallback. */
+    struct pollfd pfds[2];
+    int npfds = 0;
+
+    if (g_unix_fd >= 0) {
+        pfds[npfds].fd = g_unix_fd;
+        pfds[npfds].events = POLLIN;
+        npfds++;
+    }
+
+    while (!g_shutdown) {
+        int ret = poll(pfds, (nfds_t)npfds, 500);
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            CLAWD_ERROR("poll: %s", strerror(errno));
+            break;
+        }
+
+        for (int i = 0; i < npfds; i++) {
+            if (pfds[i].revents & POLLIN && pfds[i].fd == g_unix_fd) {
+                struct sockaddr_un peer;
+                socklen_t peer_len = sizeof(peer);
+                int client = accept(g_unix_fd,
+                                    (struct sockaddr *)&peer, &peer_len);
+                if (client >= 0) {
+                    pthread_t tid;
+                    if (pthread_create(&tid, NULL, unix_client_thread,
+                                       (void *)(intptr_t)client) == 0) {
+                        pthread_detach(tid);
+                    } else {
+                        close(client);
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    CLAWD_INFO("event loop exited");
+}
+
+/* ---- Graceful shutdown -------------------------------------------------- */
+
+static void shutdown_gateway(void)
+{
+    CLAWD_INFO("shutting down gateway");
+
+    /* Stop HTTP server. */
+    if (g_httpd) {
+        MHD_stop_daemon(g_httpd);
+        g_httpd = NULL;
+    }
+
+    /* Close Unix socket. */
+    if (g_unix_fd >= 0) {
+        close(g_unix_fd);
+        g_unix_fd = -1;
+    }
+
+    /* Remove socket file. */
+    if (g_socket_path) {
+        unlink(g_socket_path);
+    }
+
+    /* Remove PID file. */
+    pidfile_remove(g_pidfile);
+
+    /* Shutdown audit. */
+    clawd_audit_shutdown();
+
+    CLAWD_INFO("gateway shutdown complete");
+}
+
+/* ---- Usage -------------------------------------------------------------- */
+
+static void usage(void)
+{
+    printf(
+        "Usage: clawd-gateway [options]\n"
+        "\n"
+        "Options:\n"
+        "  -c, --config <path>   Configuration file path\n"
+        "  -l, --listen <addr>   Listen address (default: 127.0.0.1)\n"
+        "  -p, --port <port>     Listen port (default: 3000)\n"
+        "  -s, --socket <path>   Unix socket path\n"
+        "  -d, --daemon          Run as daemon\n"
+        "  -h, --help            Show this help\n"
+        "\n"
+        "HTTP API routes:\n"
+        "  POST /v1/chat/completions   OpenAI-compatible chat API\n"
+        "  POST /v1/messages           Anthropic-compatible messages API\n"
+        "  GET  /v1/health             Health check\n"
+        "  GET  /v1/config             Current configuration\n"
+        "  POST /v1/agent/chat         Agent chat (with tool use)\n"
+        "  GET  /v1/sessions           List active sessions\n"
+        "\n"
+    );
+}
+
+/* ---- Main --------------------------------------------------------------- */
+
+int main(int argc, char **argv)
+{
+    const char *config_path = NULL;
+
+    static struct option long_options[] = {
+        {"config",  required_argument, NULL, 'c'},
+        {"listen",  required_argument, NULL, 'l'},
+        {"port",    required_argument, NULL, 'p'},
+        {"socket",  required_argument, NULL, 's'},
+        {"daemon",  no_argument,       NULL, 'd'},
+        {"help",    no_argument,       NULL, 'h'},
+        {NULL,      0,                 NULL,  0 }
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "c:l:p:s:dh", long_options, NULL)) != -1) {
+        switch (opt) {
+        case 'c':
+            config_path = optarg;
+            break;
+        case 'l':
+            g_listen_addr = optarg;
+            break;
+        case 'p':
+            g_port = atoi(optarg);
+            if (g_port <= 0 || g_port > 65535) {
+                fprintf(stderr, "clawd-gateway: invalid port: %s\n", optarg);
+                return 1;
+            }
+            break;
+        case 's':
+            free(g_socket_path);
+            g_socket_path = strdup(optarg);
+            break;
+        case 'd':
+            g_daemonize = true;
+            break;
+        case 'h':
+            usage();
+            return 0;
+        default:
+            fprintf(stderr, "Try 'clawd-gateway --help' for more information.\n");
+            return 1;
+        }
+    }
+
+    /* Load configuration. */
+    if (config_path) {
+        if (clawd_config_load(config_path, &g_cfg) != 0) {
+            fprintf(stderr, "clawd-gateway: failed to load config: %s\n",
+                    config_path);
+            return 1;
+        }
+    } else {
+        clawd_config_load_default(&g_cfg);
+    }
+    clawd_config_merge_env(&g_cfg);
+
+    /* Apply config defaults if not overridden by CLI. */
+    if (g_cfg.gateway.host && strcmp(g_listen_addr, "127.0.0.1") == 0)
+        g_listen_addr = g_cfg.gateway.host;
+    if (g_cfg.gateway.port > 0 && g_port == 3000)
+        g_port = g_cfg.gateway.port;
+
+    /* Determine socket path. */
+    if (!g_socket_path) {
+        if (g_cfg.gateway.socket_path) {
+            g_socket_path = strdup(g_cfg.gateway.socket_path);
+        } else {
+            g_socket_path = clawd_paths_socket();
+        }
+    }
+
+    /* Initialize logging. */
+    int log_level = g_cfg.logging.level >= 0 ? g_cfg.logging.level : CLAWD_LOG_INFO;
+    clawd_log_init("clawd-gateway", log_level);
+
+    if (g_cfg.logging.file) {
+        FILE *logfp = fopen(g_cfg.logging.file, "a");
+        if (logfp)
+            clawd_log_set_file(logfp);
+        else
+            CLAWD_WARN("cannot open log file %s: %s",
+                       g_cfg.logging.file, strerror(errno));
+    }
+
+    /* Initialize audit logging. */
+    {
+        char *data_dir = clawd_paths_data_dir();
+        if (data_dir) {
+            char audit_path[512];
+            snprintf(audit_path, sizeof(audit_path), "%s/audit.jsonl", data_dir);
+            clawd_audit_init(audit_path);
+            free(data_dir);
+        }
+    }
+
+    /* Ensure directories exist. */
+    clawd_paths_ensure_dirs();
+
+    /* Daemonize if requested. */
+    if (g_daemonize) {
+        if (daemonize_process() != 0) {
+            fprintf(stderr, "clawd-gateway: failed to daemonize\n");
+            return 1;
+        }
+    }
+
+    /* Write PID file. */
+    {
+        char *runtime_dir = clawd_paths_runtime_dir();
+        if (runtime_dir) {
+            snprintf(g_pidfile, sizeof(g_pidfile),
+                     "%s/clawd-gateway.pid", runtime_dir);
+            pidfile_write(g_pidfile);
+            free(runtime_dir);
+        }
+    }
+
+    /* Install signal handlers. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sa, NULL);
+
+    /* Use the signal bridge for SIGTERM/SIGINT. */
+    clawd_signal_ctx_t *sig_ctx = clawd_signal_ctx_new();
+    if (sig_ctx) {
+        clawd_signal_watch(sig_ctx, SIGTERM, on_shutdown_signal, NULL);
+        clawd_signal_watch(sig_ctx, SIGINT, on_shutdown_signal, NULL);
+    } else {
+        /* Fallback: direct signal handlers. */
+        sa.sa_handler = (void (*)(int))on_shutdown_signal;
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
+    }
+
+    CLAWD_INFO("clawd-gateway %s starting", CLAWD_GATEWAY_VERSION);
+    CLAWD_INFO("HTTP: %s:%d", g_listen_addr, g_port);
+    CLAWD_INFO("Unix socket: %s", g_socket_path ? g_socket_path : "(none)");
+
+    /* Start HTTP server (libmicrohttpd). */
+    unsigned int mhd_flags = MHD_USE_AUTO_INTERNAL_THREAD | MHD_USE_ERROR_LOG;
+
+    g_httpd = MHD_start_daemon(
+        mhd_flags,
+        (uint16_t)g_port,
+        NULL, NULL,                       /* accept policy */
+        http_handler, NULL,               /* request handler */
+        MHD_OPTION_NOTIFY_COMPLETED, http_completed, NULL,
+        MHD_OPTION_THREAD_POOL_SIZE, (unsigned int)THREAD_POOL_SIZE,
+        MHD_OPTION_CONNECTION_TIMEOUT, (unsigned int)120,
+        MHD_OPTION_END);
+
+    if (!g_httpd) {
+        CLAWD_FATAL("failed to start HTTP server on %s:%d", g_listen_addr, g_port);
+        shutdown_gateway();
+        clawd_config_free(&g_cfg);
+        return 1;
+    }
+
+    CLAWD_INFO("HTTP server started on %s:%d with %d threads",
+               g_listen_addr, g_port, THREAD_POOL_SIZE);
+
+    /* Create Unix domain socket. */
+    if (g_socket_path) {
+        g_unix_fd = unix_socket_create(g_socket_path);
+        if (g_unix_fd < 0) {
+            CLAWD_WARN("failed to create Unix socket at %s", g_socket_path);
+            /* Non-fatal: HTTP still works. */
+        }
+    }
+
+    /* Notify systemd that we are ready. */
+#ifdef __linux__
+    sd_notify(0, "READY=1\n"
+                 "STATUS=Gateway running\n"
+                 "MAINPID=%lu", (unsigned long)getpid());
+#endif
+
+    if (!g_daemonize) {
+        fprintf(stdout, "clawd-gateway %s running on http://%s:%d\n",
+                CLAWD_GATEWAY_VERSION, g_listen_addr, g_port);
+        if (g_socket_path)
+            fprintf(stdout, "Unix socket: %s\n", g_socket_path);
+        fprintf(stdout, "Press Ctrl-C to stop.\n");
+        fflush(stdout);
+    }
+
+    /* Main event loop. */
+    event_loop();
+
+    /* Graceful shutdown. */
+#ifdef __linux__
+    sd_notify(0, "STOPPING=1\nSTATUS=Shutting down");
+#endif
+
+    shutdown_gateway();
+    clawd_signal_ctx_free(sig_ctx);
+    clawd_config_free(&g_cfg);
+    free(g_socket_path);
+
+    CLAWD_INFO("clawd-gateway exited cleanly");
+    return 0;
+}

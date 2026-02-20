@@ -1,0 +1,20 @@
+Source: libclawd-net
+Section: libs
+Priority: optional
+Maintainer: Clawd Linux Team <team@clawd.linux>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libcurl4-openssl-dev, libavahi-client-dev, libclawd-core-dev
+Standards-Version: 4.6.2
+
+Package: libclawd-net
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libclawd-core (>= ${source:Version}), libcurl4 (>= 7.88), libavahi-client3
+Description: Clawd Linux networking library
+ HTTP client, WebSocket support, mDNS discovery, and Unix socket
+ communication for the Clawd Linux system.
+
+Package: libclawd-net-dev
+Section: libdevel
+Architecture: any
+Depends: libclawd-net (= ${binary:Version}), ${misc:Depends}, libcurl4-openssl-dev, libavahi-client-dev, libclawd-core-dev
+Description: Clawd Linux networking library - development files
+ Development headers and static library for libclawd-net.

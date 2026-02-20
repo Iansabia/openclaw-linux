@@ -1,0 +1,7 @@
+Origin: Clawd Linux
+Label: Clawd Linux
+Codename: bookworm
+Architectures: amd64 arm64
+Components: main
+Description: Clawd Linux AI Assistant packages
+SignWith: default

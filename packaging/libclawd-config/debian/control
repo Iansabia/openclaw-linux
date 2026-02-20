@@ -1,0 +1,20 @@
+Source: libclawd-config
+Section: libs
+Priority: optional
+Maintainer: Clawd Linux Team <team@clawd.linux>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libyaml-dev, libclawd-core-dev
+Standards-Version: 4.6.2
+
+Package: libclawd-config
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libclawd-core (>= ${source:Version}), libyaml-0-2
+Description: Clawd Linux configuration library
+ YAML configuration parsing, validation, and management
+ for the Clawd Linux system.
+
+Package: libclawd-config-dev
+Section: libdevel
+Architecture: any
+Depends: libclawd-config (= ${binary:Version}), ${misc:Depends}, libyaml-dev, libclawd-core-dev
+Description: Clawd Linux configuration library - development files
+ Development headers and static library for libclawd-config.

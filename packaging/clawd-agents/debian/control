@@ -1,0 +1,13 @@
+Source: clawd-agents
+Section: utils
+Priority: optional
+Maintainer: Clawd Linux Team <team@clawd.linux>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libseccomp-dev, libcap-dev, libclawd-core-dev, libclawd-net-dev, libclawd-process-dev, libclawd-security-dev
+Standards-Version: 4.6.2
+
+Package: clawd-agents
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libclawd-core (>= ${source:Version}), libclawd-net (>= ${source:Version}), libclawd-process (>= ${source:Version}), libclawd-security (>= ${source:Version})
+Description: Clawd Linux AI agent framework
+ Provider integrations, tool execution, sandboxed code runners,
+ and agent orchestration for the Clawd Linux system.

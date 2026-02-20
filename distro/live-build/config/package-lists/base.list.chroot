@@ -1,0 +1,10 @@
+linux-image-amd64
+grub-efi-amd64
+systemd
+network-manager
+openssh-server
+sudo
+vim
+curl
+git
+build-essential

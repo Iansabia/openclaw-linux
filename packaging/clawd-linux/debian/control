@@ -1,0 +1,25 @@
+Source: clawd-linux
+Section: metapackages
+Priority: optional
+Maintainer: Clawd Linux Team <team@clawd.linux>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+
+Package: clawd-linux
+Architecture: all
+Depends: ${misc:Depends},
+ libclawd-core (>= 0.1.0),
+ libclawd-config (>= 0.1.0),
+ libclawd-net (>= 0.1.0),
+ libclawd-security (>= 0.1.0),
+ libclawd-process (>= 0.1.0),
+ libclawd-memory (>= 0.1.0),
+ clawd-terminal (>= 0.1.0),
+ clawd-agents (>= 0.1.0),
+ clawd-daemon (>= 0.1.0),
+ clawd-gateway (>= 0.1.0)
+Description: Clawd Linux - AI-powered Linux distribution metapackage
+ Metapackage that installs all Clawd Linux components including
+ the core libraries, AI gateway, terminal interface, agent framework,
+ and system daemon. This provides a complete AI-integrated Linux
+ environment powered by Claude.

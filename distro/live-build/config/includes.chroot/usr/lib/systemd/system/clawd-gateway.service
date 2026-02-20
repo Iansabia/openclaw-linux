@@ -1,0 +1,38 @@
+[Unit]
+Description=Clawd AI Gateway
+Documentation=https://github.com/clawd-linux/clawd-linux
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/clawd-gateway
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+WatchdogSec=30
+
+User=clawd
+Group=clawd
+RuntimeDirectory=clawd
+StateDirectory=clawd
+LogsDirectory=clawd
+ConfigurationDirectory=clawd
+
+# Hardening
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=~user
+SystemCallFilter=@system-service @sandbox
+SystemCallErrorNumber=EPERM
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

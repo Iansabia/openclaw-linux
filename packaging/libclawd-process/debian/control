@@ -1,0 +1,20 @@
+Source: libclawd-process
+Section: libs
+Priority: optional
+Maintainer: Clawd Linux Team <team@clawd.linux>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libclawd-core-dev
+Standards-Version: 4.6.2
+
+Package: libclawd-process
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libclawd-core (>= ${source:Version})
+Description: Clawd Linux process management library
+ Process spawning, lifecycle management, signal handling,
+ and process group control for the Clawd Linux system.
+
+Package: libclawd-process-dev
+Section: libdevel
+Architecture: any
+Depends: libclawd-process (= ${binary:Version}), ${misc:Depends}, libclawd-core-dev
+Description: Clawd Linux process management library - development files
+ Development headers and static library for libclawd-process.

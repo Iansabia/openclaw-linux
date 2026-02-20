@@ -1,0 +1,19 @@
+#!/bin/bash
+# Post-install hook for Clawd Linux ISO build
+
+# Create clawd system user
+useradd --system --create-home --shell /bin/bash clawd
+
+# Create required directories
+mkdir -p /var/log/clawd
+mkdir -p /run/clawd
+mkdir -p /etc/clawd
+chown clawd:clawd /var/log/clawd /run/clawd /etc/clawd
+
+# Enable the gateway service
+systemctl enable clawd-gateway.service
+
+# Set up loginctl linger for clawd user
+loginctl enable-linger clawd 2>/dev/null || true
+
+echo "Clawd Linux setup complete"

@@ -1,0 +1,20 @@
+Source: libclawd-security
+Section: libs
+Priority: optional
+Maintainer: Clawd Linux Team <team@clawd.linux>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libclawd-core-dev
+Standards-Version: 4.6.2
+
+Package: libclawd-security
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libclawd-core (>= ${source:Version})
+Description: Clawd Linux security library
+ Namespace sandboxing, capability dropping, seccomp filters,
+ and security policy enforcement for the Clawd Linux system.
+
+Package: libclawd-security-dev
+Section: libdevel
+Architecture: any
+Depends: libclawd-security (= ${binary:Version}), ${misc:Depends}, libclawd-core-dev
+Description: Clawd Linux security library - development files
+ Development headers and static library for libclawd-security.
