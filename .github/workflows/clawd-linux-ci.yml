@@ -43,7 +43,8 @@ jobs:
             libcurl4-openssl-dev libmicrohttpd-dev libwebsockets-dev \
             libsqlite3-dev libavahi-client-dev \
             libncursesw5-dev libreadline-dev \
-            libseccomp-dev libcap-dev libsystemd-dev
+            libseccomp-dev libcap-dev libsystemd-dev \
+            file dpkg-dev
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -84,7 +85,8 @@ jobs:
             libcurl4-openssl-dev libmicrohttpd-dev libwebsockets-dev \
             libsqlite3-dev libavahi-client-dev \
             libncursesw5-dev libreadline-dev \
-            libseccomp-dev libcap-dev libsystemd-dev
+            libseccomp-dev libcap-dev libsystemd-dev \
+            file dpkg-dev
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -115,7 +117,8 @@ jobs:
             libcurl4-openssl-dev libmicrohttpd-dev libwebsockets-dev \
             libsqlite3-dev libavahi-client-dev \
             libncursesw5-dev libreadline-dev \
-            libseccomp-dev libcap-dev libsystemd-dev
+            libseccomp-dev libcap-dev libsystemd-dev \
+            file dpkg-dev
 
       - name: Checkout
         uses: actions/checkout@v4

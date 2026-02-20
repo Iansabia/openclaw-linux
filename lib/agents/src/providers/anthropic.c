@@ -15,6 +15,7 @@
 #include <clawd/log.h>
 #include <clawd/err.h>
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 

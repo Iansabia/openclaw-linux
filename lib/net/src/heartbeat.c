@@ -13,9 +13,12 @@
 #include <clawd/err.h>
 #include <clawd/log.h>
 
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /* ---- Background worker -------------------------------------------------- */
 

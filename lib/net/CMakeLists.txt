@@ -64,8 +64,6 @@ target_compile_options(clawd-net PRIVATE
 set_target_properties(clawd-net PROPERTIES
     VERSION   ${PROJECT_VERSION}
     SOVERSION 0
-    C_VISIBILITY_PRESET hidden
-    VISIBILITY_INLINES_HIDDEN ON
 )
 
 # --------------------------------------------------------------------------
@@ -74,7 +72,7 @@ set_target_properties(clawd-net PROPERTIES
 include(GNUInstallDirs)
 
 install(TARGETS clawd-net
-    EXPORT  clawd-net-targets
+    EXPORT  clawd-targets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}   COMPONENT clawd-net
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}   COMPONENT clawd-net-dev
 )

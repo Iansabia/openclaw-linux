@@ -99,14 +99,14 @@ set_target_properties(clawd-process PROPERTIES
 # Install rules
 # ---------------------------------------------------------------------------
 install(TARGETS clawd-process
-    EXPORT  clawd-process-targets
-    LIBRARY  DESTINATION lib
-    ARCHIVE  DESTINATION lib
-    RUNTIME  DESTINATION bin
+    EXPORT  clawd-targets
+    LIBRARY  DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE  DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME  DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
 install(DIRECTORY include/clawd/
-    DESTINATION include/clawd
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/clawd
     FILES_MATCHING PATTERN "*.h"
 )
 

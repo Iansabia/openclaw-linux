@@ -1,8 +1,6 @@
 # clawd-linux :: libclawd-core
 # SPDX-License-Identifier: MIT
 
-cmake_minimum_required(VERSION 3.16)
-
 # ---- sources -------------------------------------------------------------
 
 set(CLAWD_CORE_SOURCES
@@ -15,18 +13,6 @@ set(CLAWD_CORE_SOURCES
     src/crypto.c
 )
 
-set(CLAWD_CORE_HEADERS
-    include/clawd/clawd.h
-    include/clawd/str.h
-    include/clawd/buf.h
-    include/clawd/vec.h
-    include/clawd/map.h
-    include/clawd/json.h
-    include/clawd/log.h
-    include/clawd/err.h
-    include/clawd/crypto.h
-)
-
 # ---- library target ------------------------------------------------------
 
 if(CLAWD_STATIC)
@@ -35,28 +21,32 @@ else()
     add_library(clawd-core SHARED ${CLAWD_CORE_SOURCES})
 endif()
 
+add_library(clawd::core ALIAS clawd-core)
+
 target_include_directories(clawd-core
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 # ---- dependencies --------------------------------------------------------
 
-# Threads (pthread)
-find_package(Threads REQUIRED)
-target_link_libraries(clawd-core PUBLIC Threads::Threads)
+target_link_libraries(clawd-core
+    PUBLIC
+        Threads::Threads
+        OpenSSL::SSL
+        OpenSSL::Crypto
+)
 
-# OpenSSL
-find_package(OpenSSL REQUIRED)
-target_link_libraries(clawd-core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
-
-# cJSON via pkg-config
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(CJSON REQUIRED libcjson)
-target_include_directories(clawd-core PUBLIC ${CJSON_INCLUDE_DIRS})
-target_link_directories(clawd-core PUBLIC ${CJSON_LIBRARY_DIRS})
-target_link_libraries(clawd-core PUBLIC ${CJSON_LIBRARIES})
+if(TARGET PkgConfig::CJSON)
+    target_link_libraries(clawd-core PUBLIC PkgConfig::CJSON)
+elseif(CJSON_FOUND)
+    target_include_directories(clawd-core PUBLIC ${CJSON_INCLUDE_DIRS})
+    target_link_directories(clawd-core PUBLIC ${CJSON_LIBRARY_DIRS})
+    target_link_libraries(clawd-core PUBLIC ${CJSON_LIBRARIES})
+else()
+    message(FATAL_ERROR "cJSON (libcjson) is required for libclawd-core")
+endif()
 
 # ---- compiler options ----------------------------------------------------
 
@@ -65,20 +55,18 @@ target_compile_options(clawd-core PRIVATE
 )
 
 set_target_properties(clawd-core PROPERTIES
-    C_STANDARD          11
+    C_STANDARD          17
     C_STANDARD_REQUIRED ON
     C_EXTENSIONS        OFF
-    VERSION             0.1.0
-    SOVERSION           0
+    VERSION             ${PROJECT_VERSION}
+    SOVERSION           ${PROJECT_VERSION_MAJOR}
     OUTPUT_NAME         clawd-core
 )
 
 # ---- install -------------------------------------------------------------
 
-include(GNUInstallDirs)
-
 install(TARGETS clawd-core
-    EXPORT  clawd-core-targets
+    EXPORT  clawd-targets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
@@ -94,9 +82,5 @@ if(CLAWD_BUILD_TESTS)
     add_executable(test_core tests/test_core.c)
     target_link_libraries(test_core PRIVATE clawd-core)
     target_compile_options(test_core PRIVATE -Wall -Wextra)
-    set_target_properties(test_core PROPERTIES
-        C_STANDARD          11
-        C_STANDARD_REQUIRED ON
-    )
     add_test(NAME test_core COMMAND test_core)
 endif()

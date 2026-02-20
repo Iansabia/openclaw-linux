@@ -1,8 +1,6 @@
 # clawd-linux :: libclawd-memory
 # SPDX-License-Identifier: MIT
 
-cmake_minimum_required(VERSION 3.16)
-
 # ---- sources -------------------------------------------------------------
 
 set(CLAWD_MEMORY_SOURCES
@@ -10,12 +8,6 @@ set(CLAWD_MEMORY_SOURCES
     src/embeddings.c
     src/watcher.c
     src/bm25.c
-)
-
-set(CLAWD_MEMORY_HEADERS
-    include/clawd/memory.h
-    include/clawd/embeddings.h
-    include/clawd/watcher.h
 )
 
 # ---- library target ------------------------------------------------------
@@ -26,43 +18,42 @@ else()
     add_library(clawd-memory SHARED ${CLAWD_MEMORY_SOURCES})
 endif()
 
+add_library(clawd::memory ALIAS clawd-memory)
+
 target_include_directories(clawd-memory
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 # ---- dependencies --------------------------------------------------------
 
-# clawd-core (provides logging, error handling, strings, JSON wrappers)
-target_link_libraries(clawd-memory PUBLIC clawd-core)
+target_link_libraries(clawd-memory
+    PUBLIC
+        clawd-core
+        Threads::Threads
+        CURL::libcurl
+        ${CMAKE_DL_LIBS}
+        m
+)
 
-# Threads (pthread)
-find_package(Threads REQUIRED)
-target_link_libraries(clawd-memory PUBLIC Threads::Threads)
+# SQLite3
+if(TARGET PkgConfig::SQLITE3)
+    target_link_libraries(clawd-memory PUBLIC PkgConfig::SQLITE3)
+elseif(SQLITE3_FOUND)
+    target_include_directories(clawd-memory PUBLIC ${SQLITE3_INCLUDE_DIRS})
+    target_link_directories(clawd-memory PUBLIC ${SQLITE3_LIBRARY_DIRS})
+    target_link_libraries(clawd-memory PUBLIC ${SQLITE3_LIBRARIES})
+else()
+    message(FATAL_ERROR "SQLite3 is required for libclawd-memory")
+endif()
 
-# SQLite3 via pkg-config
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(SQLITE3 REQUIRED sqlite3)
-target_include_directories(clawd-memory PUBLIC ${SQLITE3_INCLUDE_DIRS})
-target_link_directories(clawd-memory PUBLIC ${SQLITE3_LIBRARY_DIRS})
-target_link_libraries(clawd-memory PUBLIC ${SQLITE3_LIBRARIES})
-
-# libcurl (for embedding API HTTP requests)
-find_package(CURL REQUIRED)
-target_link_libraries(clawd-memory PUBLIC CURL::libcurl)
-
-# cJSON (for parsing embedding API responses)
-pkg_check_modules(CJSON REQUIRED libcjson)
-target_include_directories(clawd-memory PUBLIC ${CJSON_INCLUDE_DIRS})
-target_link_directories(clawd-memory PUBLIC ${CJSON_LIBRARY_DIRS})
-target_link_libraries(clawd-memory PUBLIC ${CJSON_LIBRARIES})
-
-# dl (for dynamically loading sqlite-vec extension)
-target_link_libraries(clawd-memory PUBLIC ${CMAKE_DL_LIBS})
-
-# math library
-target_link_libraries(clawd-memory PUBLIC m)
+# cJSON (already linked through clawd-core, but we need headers for embeddings.c)
+if(TARGET PkgConfig::CJSON)
+    target_link_libraries(clawd-memory PRIVATE PkgConfig::CJSON)
+elseif(CJSON_FOUND)
+    target_include_directories(clawd-memory PRIVATE ${CJSON_INCLUDE_DIRS})
+endif()
 
 # ---- platform feature checks ---------------------------------------------
 
@@ -85,20 +76,17 @@ target_compile_options(clawd-memory PRIVATE
 )
 
 set_target_properties(clawd-memory PROPERTIES
-    C_STANDARD          11
+    C_STANDARD          17
     C_STANDARD_REQUIRED ON
     C_EXTENSIONS        OFF
-    VERSION             0.1.0
-    SOVERSION           0
-    OUTPUT_NAME         clawd-memory
+    VERSION             ${PROJECT_VERSION}
+    SOVERSION           ${PROJECT_VERSION_MAJOR}
 )
 
 # ---- install -------------------------------------------------------------
 
-include(GNUInstallDirs)
-
 install(TARGETS clawd-memory
-    EXPORT  clawd-memory-targets
+    EXPORT  clawd-targets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
@@ -113,10 +101,5 @@ install(DIRECTORY include/clawd
 if(CLAWD_BUILD_TESTS)
     add_executable(test_memory tests/test_memory.c)
     target_link_libraries(test_memory PRIVATE clawd-memory)
-    target_compile_options(test_memory PRIVATE -Wall -Wextra)
-    set_target_properties(test_memory PROPERTIES
-        C_STANDARD          11
-        C_STANDARD_REQUIRED ON
-    )
     add_test(NAME test_memory COMMAND test_memory)
 endif()

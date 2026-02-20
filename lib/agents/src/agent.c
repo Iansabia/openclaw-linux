@@ -17,6 +17,7 @@
 #include <clawd/log.h>
 #include <clawd/str.h>
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 

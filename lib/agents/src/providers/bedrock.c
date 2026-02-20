@@ -17,6 +17,8 @@
 #include <clawd/err.h>
 #include <clawd/crypto.h>
 
+#include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>

@@ -9,6 +9,8 @@
 #include <clawd/log.h>
 
 #include <sqlite3.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>

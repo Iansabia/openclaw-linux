@@ -11,6 +11,8 @@
 #include <clawd/mdns.h>
 #include <clawd/log.h>
 
+#include <stdint.h>
+
 #ifdef HAVE_AVAHI
 
 #include <avahi-client/client.h>

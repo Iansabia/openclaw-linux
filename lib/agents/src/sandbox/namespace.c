@@ -11,6 +11,7 @@
 #include <clawd/sandbox.h>
 #include <clawd/log.h>
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -18,9 +19,9 @@
 
 #ifdef __linux__
 
-#define _GNU_SOURCE
 #include <sched.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <fcntl.h>

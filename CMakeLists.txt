@@ -8,6 +8,9 @@ set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+# Expose POSIX and GNU symbols (PATH_MAX, getaddrinfo, struct addrinfo, etc.)
+add_compile_definitions(_GNU_SOURCE)
+
 # -----------------------------------------------------------------------------
 # Build options
 # -----------------------------------------------------------------------------
@@ -47,6 +50,7 @@ pkg_check_modules(SECCOMP         QUIET IMPORTED_TARGET libseccomp)
 pkg_check_modules(SYSTEMD         QUIET IMPORTED_TARGET libsystemd)
 pkg_check_modules(LIBCAP          QUIET IMPORTED_TARGET libcap)
 pkg_check_modules(NCURSESW        QUIET IMPORTED_TARGET ncursesw)
+pkg_check_modules(DBUS            QUIET IMPORTED_TARGET dbus-1)
 
 # sqlite-vec extension (optional, custom find module)
 find_package(SqliteVec QUIET)
@@ -114,7 +118,7 @@ set(CPACK_PACKAGE_DESCRIPTION "clawd – a Linux-native AI agent system")
 
 set(CPACK_DEBIAN_PACKAGE_MAINTAINER "clawd maintainers <maintainers@clawd.dev>")
 set(CPACK_DEBIAN_PACKAGE_SECTION    "utils")
-set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS  ON)
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS  OFF)
 
 # Per-component .deb generation
 set(CPACK_DEB_COMPONENT_INSTALL ON)

@@ -11,6 +11,8 @@
 
 #include <curl/curl.h>
 #include <ctype.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 

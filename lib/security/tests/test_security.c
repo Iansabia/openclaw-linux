@@ -14,8 +14,10 @@
  */
 
 #include <assert.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -37,21 +39,22 @@ static int fail_count   = 0;
         test_count++; \
         const char *_test_name = (name); \
         fprintf(stderr, "  [TEST] %s ... ", _test_name); \
-        (void)_test_name;
+        (void)_test_name; \
+        int _test_passed = 1;
 
 #define TEST_END() \
-        pass_count++; \
-        fprintf(stderr, "PASS\n"); \
+        if (_test_passed) { \
+            pass_count++; \
+            fprintf(stderr, "PASS\n"); \
+        } \
     } while (0)
 
 #define TEST_ASSERT(expr) \
-    do { \
-        if (!(expr)) { \
-            fail_count++; \
-            fprintf(stderr, "FAIL (line %d: %s)\n", __LINE__, #expr); \
-            goto next_test; \
-        } \
-    } while (0)
+    if (_test_passed && !(expr)) { \
+        fail_count++; \
+        _test_passed = 0; \
+        fprintf(stderr, "FAIL (line %d: %s)\n", __LINE__, #expr); \
+    }
 
 /* ---- path traversal tests ----------------------------------------------- */
 
@@ -61,47 +64,47 @@ static void test_path_traversal(void)
 
     TEST_BEGIN("simple safe path") {
         TEST_ASSERT(clawd_fs_is_safe_path("/home/user/documents/file.txt"));
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("relative safe path") {
         TEST_ASSERT(clawd_fs_is_safe_path("foo/bar/baz.c"));
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("single dot in path is safe") {
         TEST_ASSERT(clawd_fs_is_safe_path("./foo/bar"));
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("simple traversal attack") {
         TEST_ASSERT(!clawd_fs_is_safe_path("../../../etc/passwd"));
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("traversal hidden in middle") {
         /* foo/../../ goes above foo's parent */
         TEST_ASSERT(!clawd_fs_is_safe_path("foo/../../secret"));
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("deeply nested traversal") {
         TEST_ASSERT(!clawd_fs_is_safe_path("a/b/c/../../../../etc/shadow"));
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("null path is unsafe") {
         TEST_ASSERT(!clawd_fs_is_safe_path(NULL));
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("empty path is unsafe") {
         TEST_ASSERT(!clawd_fs_is_safe_path(""));
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("root path is safe") {
         TEST_ASSERT(clawd_fs_is_safe_path("/"));
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("traversal at start of absolute path") {
         /* /.. would go above root -- but on a real FS /.. == / so depth
          * does not go negative.  However our checker sees "/.." and depth
          * goes 0 -> -1 which is caught. */
         TEST_ASSERT(!clawd_fs_is_safe_path("/.."));
-    } TEST_END(); next_test:;
+    } TEST_END();
 }
 
 /* ---- safe resolution tests ---------------------------------------------- */
@@ -117,32 +120,32 @@ static void test_safe_resolution(void)
         /* We mostly just verify it doesn't crash and handles input. */
         (void)rc;
         /* At minimum it should not return an escape path. */
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("reject absolute relative path") {
         char out[PATH_MAX];
         int rc = clawd_fs_resolve_safe("/tmp", "/etc/passwd", out, sizeof(out));
         TEST_ASSERT(rc == -1);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("reject traversal in relative") {
         char out[PATH_MAX];
         int rc = clawd_fs_resolve_safe("/tmp", "../etc/passwd", out, sizeof(out));
         TEST_ASSERT(rc == -1);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("reject null base") {
         char out[PATH_MAX];
         int rc = clawd_fs_resolve_safe(NULL, "foo.txt", out, sizeof(out));
         TEST_ASSERT(rc == -1);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("reject relative base") {
         char out[PATH_MAX];
         int rc = clawd_fs_resolve_safe("relative/base", "foo.txt",
                                        out, sizeof(out));
         TEST_ASSERT(rc == -1);
-    } TEST_END(); next_test:;
+    } TEST_END();
 }
 
 /* ---- filesystem permission tests ---------------------------------------- */
@@ -154,13 +157,13 @@ static void test_fs_permissions(void)
     TEST_BEGIN("check read permission on /tmp") {
         int rc = clawd_fs_check_perm("/tmp", CLAWD_PERM_READ);
         TEST_ASSERT(rc == 0);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("check nonexistent path") {
         int rc = clawd_fs_check_perm("/nonexistent_path_xyzzy_12345",
                                      CLAWD_PERM_READ);
         TEST_ASSERT(rc == -1);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("check ownership of /tmp") {
         /* We just check it returns a boolean without crashing. */
@@ -170,17 +173,17 @@ static void test_fs_permissions(void)
             TEST_ASSERT(owned);
         }
         /* Non-root: we just verify the function runs without error. */
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("check ownership of null path") {
         bool owned = clawd_fs_check_ownership(NULL, 0);
         TEST_ASSERT(!owned);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("check null path perm") {
         int rc = clawd_fs_check_perm(NULL, CLAWD_PERM_READ);
         TEST_ASSERT(rc == -1);
-    } TEST_END(); next_test:;
+    } TEST_END();
 }
 
 /* ---- policy rule matching tests ----------------------------------------- */
@@ -197,7 +200,7 @@ static void test_policy(void)
         TEST_ASSERT(a == CLAWD_POLICY_ALLOW);
 
         clawd_policy_free(p);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("explicit deny rule") {
         clawd_policy_t *p = clawd_policy_new();
@@ -220,7 +223,7 @@ static void test_policy(void)
         TEST_ASSERT(a == CLAWD_POLICY_ALLOW);
 
         clawd_policy_free(p);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("wildcard tool name") {
         clawd_policy_t *p = clawd_policy_new();
@@ -242,7 +245,7 @@ static void test_policy(void)
                     CLAWD_POLICY_ALLOW);
 
         clawd_policy_free(p);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("first match wins") {
         clawd_policy_t *p = clawd_policy_new();
@@ -275,7 +278,7 @@ static void test_policy(void)
                     CLAWD_POLICY_AUDIT);
 
         clawd_policy_free(p);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("default rules include deny for rm -rf /") {
         clawd_policy_t *p = clawd_policy_new();
@@ -287,7 +290,7 @@ static void test_policy(void)
                     CLAWD_POLICY_DENY);
 
         clawd_policy_free(p);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("default rules deny writing to /etc") {
         clawd_policy_t *p = clawd_policy_new();
@@ -299,7 +302,7 @@ static void test_policy(void)
                     CLAWD_POLICY_DENY);
 
         clawd_policy_free(p);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("default rules audit bash commands") {
         clawd_policy_t *p = clawd_policy_new();
@@ -312,7 +315,7 @@ static void test_policy(void)
                     CLAWD_POLICY_AUDIT);
 
         clawd_policy_free(p);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("ask action") {
         clawd_policy_t *p = clawd_policy_new();
@@ -330,12 +333,12 @@ static void test_policy(void)
                     CLAWD_POLICY_ASK);
 
         clawd_policy_free(p);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("null policy check") {
         TEST_ASSERT(clawd_policy_check(NULL, "bash", "ls") ==
                     CLAWD_POLICY_ALLOW);
-    } TEST_END(); next_test:;
+    } TEST_END();
 }
 
 /* ---- path scanner tests ------------------------------------------------- */
@@ -352,7 +355,7 @@ static void test_path_scanner(void)
         TEST_ASSERT(clawd_path_scanner_check(s, "/etc/passwd"));
 
         clawd_path_scanner_free(s);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("deny .env files") {
         clawd_path_scanner_t *s = clawd_path_scanner_new();
@@ -365,7 +368,7 @@ static void test_path_scanner(void)
         TEST_ASSERT(clawd_path_scanner_check(s, "/app/config.yaml"));
 
         clawd_path_scanner_free(s);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("deny .ssh paths") {
         clawd_path_scanner_t *s = clawd_path_scanner_new();
@@ -378,7 +381,7 @@ static void test_path_scanner(void)
         TEST_ASSERT(clawd_path_scanner_check(s, "/home/user/doc.txt"));
 
         clawd_path_scanner_free(s);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("deny key files") {
         clawd_path_scanner_t *s = clawd_path_scanner_new();
@@ -392,7 +395,7 @@ static void test_path_scanner(void)
         TEST_ASSERT(clawd_path_scanner_check(s, "/certs/server.crt"));
 
         clawd_path_scanner_free(s);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("deny /proc and /sys") {
         clawd_path_scanner_t *s = clawd_path_scanner_new();
@@ -406,7 +409,7 @@ static void test_path_scanner(void)
         TEST_ASSERT(clawd_path_scanner_check(s, "/var/log/syslog"));
 
         clawd_path_scanner_free(s);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("first match wins (allow overrides later deny)") {
         clawd_path_scanner_t *s = clawd_path_scanner_new();
@@ -423,7 +426,7 @@ static void test_path_scanner(void)
         TEST_ASSERT(!clawd_path_scanner_check(s, "/app/.env"));
 
         clawd_path_scanner_free(s);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("default patterns deny sensitive files") {
         clawd_path_scanner_t *s = clawd_path_scanner_new();
@@ -446,7 +449,7 @@ static void test_path_scanner(void)
         TEST_ASSERT(clawd_path_scanner_check(s, "/home/user/README.md"));
 
         clawd_path_scanner_free(s);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("null path is denied") {
         clawd_path_scanner_t *s = clawd_path_scanner_new();
@@ -455,11 +458,11 @@ static void test_path_scanner(void)
         TEST_ASSERT(!clawd_path_scanner_check(s, NULL));
 
         clawd_path_scanner_free(s);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("null scanner is denied") {
         TEST_ASSERT(!clawd_path_scanner_check(NULL, "/some/path"));
-    } TEST_END(); next_test:;
+    } TEST_END();
 }
 
 /* ---- audit tests -------------------------------------------------------- */
@@ -493,7 +496,7 @@ static void test_audit(void)
 
         clawd_audit_shutdown();
         unlink(path);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("log event writes JSON line") {
         char path[] = "/tmp/clawd_test_audit_XXXXXX";
@@ -533,7 +536,7 @@ static void test_audit(void)
         TEST_ASSERT(strstr(line, "\"subject\":\"agent-1\"") != NULL);
         TEST_ASSERT(strstr(line, "\"object\":\"/home/user/test.txt\"") != NULL);
         TEST_ASSERT(strstr(line, "\"allowed\":true") != NULL);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("min level filtering") {
         char path[] = "/tmp/clawd_test_audit_XXXXXX";
@@ -585,7 +588,7 @@ static void test_audit(void)
         unlink(path);
 
         TEST_ASSERT(line_count == 1);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("sink callback receives events") {
         char path[] = "/tmp/clawd_test_audit_XXXXXX";
@@ -620,7 +623,7 @@ static void test_audit(void)
 
         clawd_audit_shutdown();
         unlink(path);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("violation level event") {
         char path[] = "/tmp/clawd_test_audit_XXXXXX";
@@ -655,7 +658,7 @@ static void test_audit(void)
         TEST_ASSERT(got != NULL);
         TEST_ASSERT(strstr(line, "\"level\":\"violation\"") != NULL);
         TEST_ASSERT(strstr(line, "\"allowed\":false") != NULL);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("JSON escaping in event fields") {
         char path[] = "/tmp/clawd_test_audit_XXXXXX";
@@ -693,7 +696,7 @@ static void test_audit(void)
         TEST_ASSERT(strstr(line, "\\\\") != NULL);
         TEST_ASSERT(strstr(line, "\\n") != NULL);
         TEST_ASSERT(strstr(line, "\\t") != NULL);
-    } TEST_END(); next_test:;
+    } TEST_END();
 }
 
 /* ---- scan permissions test ---------------------------------------------- */
@@ -707,18 +710,18 @@ static void test_scan_permissions(void)
         int result = clawd_fs_scan_permissions("/tmp", 0);
         /* result >= 0 means it ran; -1 would be an error. */
         TEST_ASSERT(result >= 0);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("scan nonexistent directory") {
         int result = clawd_fs_scan_permissions(
             "/nonexistent_dir_xyzzy_12345", 0);
         TEST_ASSERT(result == -1);
-    } TEST_END(); next_test:;
+    } TEST_END();
 
     TEST_BEGIN("scan null directory") {
         int result = clawd_fs_scan_permissions(NULL, 0);
         TEST_ASSERT(result == -1);
-    } TEST_END(); next_test:;
+    } TEST_END();
 }
 
 /* ---- main --------------------------------------------------------------- */

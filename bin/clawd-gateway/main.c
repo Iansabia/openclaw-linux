@@ -30,6 +30,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,9 +42,12 @@
 
 #ifdef __linux__
 #include <sys/epoll.h>
-#include <systemd/sd-daemon.h>
 #elif defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/event.h>
+#endif
+
+#ifdef HAVE_SYSTEMD
+#include <systemd/sd-daemon.h>
 #endif
 
 #include <poll.h>
@@ -1200,10 +1204,14 @@ int main(int argc, char **argv)
     }
 
     /* Notify systemd that we are ready. */
-#ifdef __linux__
-    sd_notify(0, "READY=1\n"
-                 "STATUS=Gateway running\n"
-                 "MAINPID=%lu", (unsigned long)getpid());
+#ifdef HAVE_SYSTEMD
+    {
+        char notify_msg[256];
+        snprintf(notify_msg, sizeof(notify_msg),
+                 "READY=1\nSTATUS=Gateway running\nMAINPID=%lu",
+                 (unsigned long)getpid());
+        sd_notify(0, notify_msg);
+    }
 #endif
 
     if (!g_daemonize) {
@@ -1219,7 +1227,7 @@ int main(int argc, char **argv)
     event_loop();
 
     /* Graceful shutdown. */
-#ifdef __linux__
+#ifdef HAVE_SYSTEMD
     sd_notify(0, "STOPPING=1\nSTATUS=Shutting down");
 #endif
 

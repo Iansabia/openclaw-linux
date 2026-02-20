@@ -8,6 +8,8 @@
 #include <clawd/watcher.h>
 #include <clawd/log.h>
 
+#include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>

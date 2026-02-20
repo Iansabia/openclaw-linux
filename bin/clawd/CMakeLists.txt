@@ -1,7 +1,6 @@
 # clawd-linux :: clawd CLI binary
 # SPDX-License-Identifier: MIT
 
-cmake_minimum_required(VERSION 3.16)
 
 # ---- sources -------------------------------------------------------------
 

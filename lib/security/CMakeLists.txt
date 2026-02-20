@@ -24,10 +24,12 @@ else()
     add_library(clawd-security SHARED ${SECURITY_SOURCES})
 endif()
 
+add_library(clawd::security ALIAS clawd-security)
+
 target_include_directories(clawd-security
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(clawd-security
@@ -46,14 +48,14 @@ set_target_properties(clawd-security PROPERTIES
 # ---------- install --------------------------------------------------------
 
 install(TARGETS clawd-security
-    EXPORT  clawd-security-targets
-    LIBRARY  DESTINATION lib     COMPONENT security
-    ARCHIVE  DESTINATION lib     COMPONENT security
-    RUNTIME  DESTINATION bin     COMPONENT security
+    EXPORT  clawd-targets
+    LIBRARY  DESTINATION ${CMAKE_INSTALL_LIBDIR}     COMPONENT security
+    ARCHIVE  DESTINATION ${CMAKE_INSTALL_LIBDIR}     COMPONENT security
+    RUNTIME  DESTINATION ${CMAKE_INSTALL_BINDIR}     COMPONENT security
 )
 
 install(FILES ${SECURITY_HEADERS}
-    DESTINATION include/clawd
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/clawd
     COMPONENT   security
 )
 

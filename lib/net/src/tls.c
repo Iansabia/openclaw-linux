@@ -12,6 +12,7 @@
 #include <openssl/err.h>
 #include <openssl/x509.h>
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
