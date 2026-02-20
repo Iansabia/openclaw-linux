@@ -351,7 +351,7 @@ static int ws_handshake(const char *host, const char *path)
 
 /* ---- Gateway Unix socket (JSON-RPC) ------------------------------------- */
 
-static char *gateway_chat(const char *message)
+static char *gateway_chat(const char *message, const char *channel_id, const char *user_id)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
@@ -371,6 +371,10 @@ static char *gateway_chat(const char *message)
 
     cJSON *params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "message", message);
+    if (channel_id)
+        cJSON_AddStringToObject(params, "channel_id", channel_id);
+    if (user_id)
+        cJSON_AddStringToObject(params, "user_id", user_id);
 
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "jsonrpc", "2.0");
@@ -708,7 +712,7 @@ static void handle_slack_event(cJSON *envelope)
             CLAWD_INFO("message from %s in %s: %.80s%s",
                        user, channel, p, strlen(p) > 80 ? "..." : "");
 
-            char *response = gateway_chat(p);
+            char *response = gateway_chat(p, channel, user);
             free(cleaned);
 
             if (response && *response) {
@@ -726,7 +730,7 @@ static void handle_slack_event(cJSON *envelope)
     CLAWD_INFO("message from %s in %s: %.80s%s",
                user, channel, msg, strlen(msg) > 80 ? "..." : "");
 
-    char *response = gateway_chat(msg);
+    char *response = gateway_chat(msg, channel, user);
 
     if (response && *response) {
         slack_send_message(channel, response);

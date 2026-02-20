@@ -25,6 +25,7 @@ typedef struct clawd_agent_opts {
     clawd_provider_t *provider;
     clawd_tool_ctx_t *tools;
     const char       *system_prompt;
+    const char       *model;            /* model name (passed to provider) */
     int               max_turns;         /* max tool-use iterations (default 10) */
     bool              sandbox_tools;     /* run tools in sandbox */
     clawd_stream_cb   on_stream;         /* streaming output callback */

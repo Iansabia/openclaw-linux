@@ -53,6 +53,7 @@ typedef struct clawd_config {
         char  *default_provider;   /* "anthropic", "openai", ... */
         char  *default_model;
         char  *api_key;
+        char  *system_prompt;      /* default system prompt for all chats */
         int    max_tokens;
         float  temperature;
     } model;

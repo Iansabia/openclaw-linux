@@ -29,6 +29,7 @@ struct clawd_agent {
     clawd_provider_t *provider;
     clawd_tool_ctx_t *tools;
     char             *system_prompt;
+    char             *model;
     int               max_turns;
     bool              sandbox_tools;
     clawd_stream_cb   on_stream;
@@ -71,6 +72,9 @@ clawd_agent_t *clawd_agent_new(const clawd_agent_opts_t *opts)
     if (opts->system_prompt) {
         a->system_prompt = strdup(opts->system_prompt);
     }
+    if (opts->model) {
+        a->model = strdup(opts->model);
+    }
 
     a->history = NULL;
     return a;
@@ -82,6 +86,7 @@ void clawd_agent_free(clawd_agent_t *a)
 
     clawd_message_free(a->history);
     free(a->system_prompt);
+    free(a->model);
     free(a);
 }
 
@@ -126,6 +131,7 @@ int clawd_agent_chat(clawd_agent_t *a, const char *user_message, char **response
 
         /* Build completion options */
         clawd_completion_opts_t opts = {0};
+        opts.model         = a->model;
         opts.messages      = a->history;
         opts.system_prompt = a->system_prompt;
         opts.tools_json    = tools_json;

@@ -149,7 +149,8 @@ static cJSON *tg_api_call(const char *method, cJSON *params)
 
 /* ---- Gateway Unix socket (JSON-RPC) ------------------------------------- */
 
-static char *gateway_chat(const char *message)
+static char *gateway_chat(const char *message, const char *channel_id,
+                          const char *user_id)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -172,6 +173,10 @@ static char *gateway_chat(const char *message)
 
     cJSON *params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "message", message);
+    if (channel_id)
+        cJSON_AddStringToObject(params, "channel_id", channel_id);
+    if (user_id)
+        cJSON_AddStringToObject(params, "user_id", user_id);
 
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "jsonrpc", "2.0");
@@ -368,8 +373,22 @@ static void handle_update(cJSON *update)
     /* Show "typing..." */
     tg_send_chat_action(chat_id, "typing");
 
+    /* Build string representations of chat_id and user_id for the gateway */
+    char chat_id_str[32];
+    snprintf(chat_id_str, sizeof(chat_id_str), "%lld", (long long)chat_id);
+
+    char user_id_str[32];
+    const char *user_id_ptr = NULL;
+    if (from) {
+        int64_t from_id = (int64_t)clawd_json_get_int(from, "id", 0);
+        if (from_id != 0) {
+            snprintf(user_id_str, sizeof(user_id_str), "%lld", (long long)from_id);
+            user_id_ptr = user_id_str;
+        }
+    }
+
     /* Forward to gateway */
-    char *response = gateway_chat(msg);
+    char *response = gateway_chat(msg, chat_id_str, user_id_ptr);
 
     if (response && *response) {
         /* Telegram has a 4096 char limit per message */

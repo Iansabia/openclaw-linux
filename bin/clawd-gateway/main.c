@@ -103,35 +103,121 @@ static char                  g_pidfile[512]  = {0};
 static int                   g_ws_fd         = -1;
 static int                   g_ws_port       = 0;
 
-/* ---- Session tracking --------------------------------------------------- */
+/* ---- Session tracking (with conversation history) ----------------------- */
+
+#define MAX_HISTORY_MESSAGES  50   /* per session */
 
 typedef struct {
     char     id[64];
+    char     channel_id[128];      /* channel or DM identifier */
+    char     user_id[128];         /* user identifier */
     time_t   created;
     time_t   last_active;
     bool     active;
+    /* Conversation history: circular buffer of role+content pairs */
+    struct {
+        char *role;
+        char *content;
+    } history[MAX_HISTORY_MESSAGES];
+    int      history_count;
 } gateway_session_t;
 
 static gateway_session_t g_sessions[MAX_SESSIONS];
 static pthread_mutex_t   g_sessions_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static gateway_session_t *session_create(void)
+static void session_clear_history(gateway_session_t *s)
 {
+    for (int i = 0; i < s->history_count; i++) {
+        free(s->history[i].role);
+        free(s->history[i].content);
+        s->history[i].role = NULL;
+        s->history[i].content = NULL;
+    }
+    s->history_count = 0;
+}
+
+static void session_add_message(gateway_session_t *s,
+                                 const char *role, const char *content)
+{
+    if (s->history_count >= MAX_HISTORY_MESSAGES) {
+        /* Drop oldest message */
+        free(s->history[0].role);
+        free(s->history[0].content);
+        memmove(&s->history[0], &s->history[1],
+                (MAX_HISTORY_MESSAGES - 1) * sizeof(s->history[0]));
+        s->history_count = MAX_HISTORY_MESSAGES - 1;
+    }
+    s->history[s->history_count].role    = strdup(role);
+    s->history[s->history_count].content = strdup(content);
+    s->history_count++;
+    s->last_active = time(NULL);
+}
+
+static gateway_session_t *session_find(const char *channel_id,
+                                        const char *user_id)
+{
+    if (!channel_id) return NULL;
+    const char *uid = user_id ? user_id : "";
+
     pthread_mutex_lock(&g_sessions_lock);
     for (int i = 0; i < MAX_SESSIONS; i++) {
-        if (!g_sessions[i].active) {
-            g_sessions[i].active = true;
-            g_sessions[i].created = time(NULL);
-            g_sessions[i].last_active = g_sessions[i].created;
-            snprintf(g_sessions[i].id, sizeof(g_sessions[i].id),
-                     "sess_%08x%08x",
-                     (unsigned)g_sessions[i].created, (unsigned)i);
+        if (g_sessions[i].active &&
+            strcmp(g_sessions[i].channel_id, channel_id) == 0 &&
+            strcmp(g_sessions[i].user_id, uid) == 0) {
             pthread_mutex_unlock(&g_sessions_lock);
             return &g_sessions[i];
         }
     }
     pthread_mutex_unlock(&g_sessions_lock);
     return NULL;
+}
+
+static gateway_session_t *session_find_or_create(const char *channel_id,
+                                                   const char *user_id)
+{
+    gateway_session_t *s = session_find(channel_id, user_id);
+    if (s) return s;
+
+    const char *uid = user_id ? user_id : "";
+
+    pthread_mutex_lock(&g_sessions_lock);
+    /* Find oldest inactive, or evict LRU if full */
+    int slot = -1;
+    time_t oldest = 0;
+    int oldest_slot = 0;
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (!g_sessions[i].active) {
+            slot = i;
+            break;
+        }
+        if (oldest == 0 || g_sessions[i].last_active < oldest) {
+            oldest = g_sessions[i].last_active;
+            oldest_slot = i;
+        }
+    }
+    if (slot < 0) {
+        /* Evict LRU session */
+        session_clear_history(&g_sessions[oldest_slot]);
+        slot = oldest_slot;
+    }
+
+    gateway_session_t *ns = &g_sessions[slot];
+    memset(ns, 0, sizeof(*ns));
+    ns->active = true;
+    ns->created = time(NULL);
+    ns->last_active = ns->created;
+    snprintf(ns->id, sizeof(ns->id), "sess_%08x%08x",
+             (unsigned)ns->created, (unsigned)slot);
+    snprintf(ns->channel_id, sizeof(ns->channel_id), "%s",
+             channel_id ? channel_id : "");
+    snprintf(ns->user_id, sizeof(ns->user_id), "%s", uid);
+    pthread_mutex_unlock(&g_sessions_lock);
+    return ns;
+}
+
+static gateway_session_t *session_create(void)
+{
+    return session_find_or_create("_anonymous_", "_anonymous_");
 }
 
 static int session_count_active(void)
@@ -857,29 +943,55 @@ static void unix_client_handle(int client_fd)
         cJSON_AddStringToObject(err, "message", "invalid request: missing method");
     } else if (strcmp(method, "chat.send") == 0) {
         const char *message = params ? clawd_json_get_string(params, "message") : NULL;
+        const char *channel_id = params ? clawd_json_get_string(params, "channel_id") : NULL;
+        const char *user_id = params ? clawd_json_get_string(params, "user_id") : NULL;
         if (!message) {
             cJSON *err = cJSON_AddObjectToObject(resp, "error");
             cJSON_AddNumberToObject(err, "code", -32602);
             cJSON_AddStringToObject(err, "message", "missing 'message' parameter");
         } else {
-            CLAWD_INFO("chat.send: len=%zu", strlen(message));
+            CLAWD_INFO("chat.send: len=%zu ch=%s user=%s",
+                       strlen(message),
+                       channel_id ? channel_id : "-",
+                       user_id ? user_id : "-");
 
 #ifdef HAVE_AGENTS
+            /* Find or create session for this channel+user */
+            gateway_session_t *sess = channel_id
+                ? session_find_or_create(channel_id, user_id)
+                : session_create();
+
+            /* Add user message to history */
+            if (sess) session_add_message(sess, "user", message);
+
             clawd_provider_type_t ptype = resolve_provider_type(
                 g_cfg.model.default_provider);
             clawd_provider_t *provider = clawd_provider_new(ptype,
                 g_cfg.model.api_key);
             char *agent_response = NULL;
             if (provider) {
-                /* Build a single user message */
-                clawd_message_t *msg_list = clawd_message_new(
-                    CLAWD_ROLE_USER, message);
+                /* Build message list from session history */
+                clawd_message_t *msg_list = NULL;
+                if (sess) {
+                    for (int i = 0; i < sess->history_count; i++) {
+                        clawd_role_t role = CLAWD_ROLE_USER;
+                        if (strcmp(sess->history[i].role, "assistant") == 0)
+                            role = CLAWD_ROLE_ASSISTANT;
+                        clawd_message_t *m = clawd_message_new(
+                            role, sess->history[i].content);
+                        if (m) clawd_message_append(&msg_list, m);
+                    }
+                } else {
+                    msg_list = clawd_message_new(CLAWD_ROLE_USER, message);
+                }
+
                 const char *effective_model = g_cfg.model.default_model
                     ? g_cfg.model.default_model : NULL;
                 clawd_completion_opts_t opts = {
                     .model = effective_model, .messages = msg_list,
-                    .system_prompt = NULL,
-                    .max_tokens = 4096,
+                    .system_prompt = g_cfg.model.system_prompt,
+                    .max_tokens = g_cfg.model.max_tokens > 0
+                        ? g_cfg.model.max_tokens : 4096,
                     .temperature = g_cfg.model.temperature,
                     .tools_json = NULL,
                     .stream = false, .stream_cb = NULL,
@@ -891,6 +1003,9 @@ static void unix_client_handle(int client_fd)
                 if (rc == 0 && comp.content) {
                     agent_response = comp.content;
                     comp.content = NULL;
+                    /* Add assistant response to history */
+                    if (sess)
+                        session_add_message(sess, "assistant", agent_response);
                 } else {
                     CLAWD_ERROR("chat.send: provider complete failed (rc=%d)", rc);
                 }

@@ -563,7 +563,9 @@ static int gateway_connect_unix(const char *path)
  * Send a chat message to clawd-gateway via JSON-RPC and return the response.
  * Caller must free the returned string.
  */
-static char *gateway_chat(const char *message)
+static char *gateway_chat(const char *message,
+                           const char *channel_id,
+                           const char *user_id)
 {
     int fd = gateway_connect_unix(g_socket_path);
     if (fd < 0)
@@ -573,6 +575,10 @@ static char *gateway_chat(const char *message)
 
     cJSON *params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "message", message);
+    if (channel_id)
+        cJSON_AddStringToObject(params, "channel_id", channel_id);
+    if (user_id)
+        cJSON_AddStringToObject(params, "user_id", user_id);
 
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "jsonrpc", "2.0");
@@ -834,7 +840,7 @@ static void handle_message_create(cJSON *data)
     discord_send_typing(channel_id);
 
     /* Forward to clawd-gateway */
-    char *response = gateway_chat(msg);
+    char *response = gateway_chat(msg, channel_id, author_id);
 
     if (response && *response) {
         /* Discord messages have a 2000 char limit; split if needed */

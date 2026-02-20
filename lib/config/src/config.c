@@ -603,6 +603,7 @@ clawd_config_free(clawd_config_t *cfg)
     free(cfg->model.default_provider);
     free(cfg->model.default_model);
     free(cfg->model.api_key);
+    free(cfg->model.system_prompt);
 
     for (int i = 0; i < cfg->security.allowed_paths_count; i++)
         free(cfg->security.allowed_paths[i]);
@@ -735,6 +736,7 @@ clawd_config_merge_env(clawd_config_t *cfg)
     if ((v = getenv("CLAWD_PROVIDER")))     set_str(&cfg->model.default_provider, v);
     if ((v = getenv("CLAWD_MODEL")))        set_str(&cfg->model.default_model, v);
     if ((v = getenv("CLAWD_API_KEY")))      set_str(&cfg->model.api_key, v);
+    if ((v = getenv("CLAWD_SYSTEM_PROMPT"))) set_str(&cfg->model.system_prompt, v);
     if ((v = getenv("CLAWD_LOG_FILE")))     set_str(&cfg->logging.file, v);
     if ((v = getenv("CLAWD_PROFILE")))      set_str(&cfg->profile, v);
 

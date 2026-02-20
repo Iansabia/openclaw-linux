@@ -179,7 +179,8 @@ static int signal_send_message(const char *recipient, const char *text)
 
 /* ---- Gateway Unix socket (JSON-RPC) ------------------------------------- */
 
-static char *gateway_chat(const char *message)
+static char *gateway_chat(const char *message, const char *channel_id,
+                          const char *user_id)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
@@ -199,6 +200,10 @@ static char *gateway_chat(const char *message)
 
     cJSON *params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "message", message);
+    if (channel_id)
+        cJSON_AddStringToObject(params, "channel_id", channel_id);
+    if (user_id)
+        cJSON_AddStringToObject(params, "user_id", user_id);
 
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "jsonrpc", "2.0");
@@ -326,7 +331,7 @@ static void handle_signal_message(cJSON *msg)
                text, strlen(text) > 80 ? "..." : "");
 
     /* Forward to gateway */
-    char *response = gateway_chat(text);
+    char *response = gateway_chat(text, reply_to, source);
 
     if (response && *response) {
         signal_send_message(reply_to, response);
