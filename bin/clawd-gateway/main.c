@@ -21,7 +21,16 @@
 #include <clawd/signals.h>
 #include <clawd/audit.h>
 
+#ifdef HAVE_AGENTS
+#include <clawd/agent.h>
+#include <clawd/provider.h>
+#endif
+
 #include <cjson/cJSON.h>
+
+#include <openssl/evp.h>
+
+#include <arpa/inet.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -66,6 +75,16 @@
 #define UNIX_BUF_SIZE         65536
 #define THREAD_POOL_SIZE      8
 
+/* ---- WebSocket constants ------------------------------------------------ */
+
+#define WS_GUID               "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+#define WS_MAX_FRAME_SIZE     (1 * 1024 * 1024)
+#define WS_OPCODE_TEXT        0x01
+#define WS_OPCODE_BINARY      0x02
+#define WS_OPCODE_CLOSE       0x08
+#define WS_OPCODE_PING        0x09
+#define WS_OPCODE_PONG        0x0A
+
 /* ---- Global state ------------------------------------------------------- */
 
 static clawd_config_t        g_cfg;
@@ -74,10 +93,15 @@ static int                   g_port          = 3000;
 static char                 *g_socket_path   = NULL;
 static bool                  g_daemonize     = false;
 static volatile sig_atomic_t g_shutdown      = 0;
+static time_t                g_start_time    = 0;
 
 static struct MHD_Daemon    *g_httpd         = NULL;
 static int                   g_unix_fd       = -1;
 static char                  g_pidfile[512]  = {0};
+
+/* WebSocket listener (separate TCP socket on g_port + 1) */
+static int                   g_ws_fd         = -1;
+static int                   g_ws_port       = 0;
 
 /* ---- Session tracking --------------------------------------------------- */
 
@@ -168,6 +192,57 @@ static struct MHD_Response *json_success_response(cJSON *result)
     return resp;
 }
 
+
+/* ---- Agent integration helpers ------------------------------------------ */
+
+#ifdef HAVE_AGENTS
+
+static clawd_provider_type_t resolve_provider_type(const char *name)
+{
+    if (\!name)
+        return CLAWD_PROVIDER_ANTHROPIC;
+    if (strcmp(name, "openai") == 0)
+        return CLAWD_PROVIDER_OPENAI;
+    if (strcmp(name, "google") == 0)
+        return CLAWD_PROVIDER_GOOGLE;
+    if (strcmp(name, "ollama") == 0)
+        return CLAWD_PROVIDER_OLLAMA;
+    if (strcmp(name, "bedrock") == 0)
+        return CLAWD_PROVIDER_BEDROCK;
+    return CLAWD_PROVIDER_ANTHROPIC;
+}
+
+static clawd_message_t *messages_from_json(cJSON *arr)
+{
+    clawd_message_t *head = NULL;
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, arr) {
+        const char *role_str = clawd_json_get_string(item, "role");
+        const char *content  = clawd_json_get_string(item, "content");
+        if (\!role_str || \!content) continue;
+        clawd_role_t role = CLAWD_ROLE_USER;
+        if (strcmp(role_str, "assistant") == 0) role = CLAWD_ROLE_ASSISTANT;
+        else if (strcmp(role_str, "system") == 0) role = CLAWD_ROLE_SYSTEM;
+        else if (strcmp(role_str, "tool") == 0) role = CLAWD_ROLE_TOOL;
+        clawd_message_t *msg = clawd_message_new(role, content);
+        if (msg) clawd_message_append(&head, msg);
+    }
+    return head;
+}
+
+static const char *extract_system_prompt(cJSON *messages)
+{
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, messages) {
+        const char *role = clawd_json_get_string(item, "role");
+        if (role && strcmp(role, "system") == 0)
+            return clawd_json_get_string(item, "content");
+    }
+    return NULL;
+}
+
+#endif /* HAVE_AGENTS */
+
 /* ---- Route: POST /v1/chat/completions (OpenAI-compatible) --------------- */
 
 static enum MHD_Result handle_chat_completions(
@@ -194,27 +269,68 @@ static enum MHD_Result handle_chat_completions(
         return ret;
     }
 
-    (void)model;
     (void)stream;
-    (void)max_tokens;
 
     CLAWD_INFO("chat/completions: model=%s, messages=%d, stream=%s",
                model ? model : "(default)",
                cJSON_GetArraySize(messages),
                stream ? "true" : "false");
 
-    /* Build a response in OpenAI format. */
     gateway_session_t *sess = session_create();
+
+    const char *effective_model = model ? model
+        : (g_cfg.model.default_model
+               ? g_cfg.model.default_model
+               : "claude-sonnet-4-20250514");
+
+    const char *response_content = NULL;
+    int prompt_tokens = 0;
+    int completion_tokens = 0;
+
+#ifdef HAVE_AGENTS
+    clawd_provider_type_t ptype = resolve_provider_type(
+        g_cfg.model.default_provider);
+    clawd_provider_t *provider = clawd_provider_new(ptype,
+        g_cfg.model.api_key);
+    char *agent_response = NULL;
+
+    if (provider) {
+        clawd_message_t *msg_list = messages_from_json(messages);
+        const char *sys_prompt = extract_system_prompt(messages);
+        clawd_completion_opts_t opts = {
+            .model = effective_model, .messages = msg_list,
+            .system_prompt = sys_prompt, .max_tokens = max_tokens,
+            .temperature = g_cfg.model.temperature, .tools_json = NULL,
+            .stream = false, .stream_cb = NULL, .stream_userdata = NULL
+        };
+        clawd_completion_t result;
+        memset(&result, 0, sizeof(result));
+        if (clawd_provider_complete(provider, &opts, &result) == 0) {
+            agent_response = result.content;
+            result.content = NULL;
+            prompt_tokens = result.input_tokens;
+            completion_tokens = result.output_tokens;
+        } else {
+            CLAWD_ERROR("provider completion failed");
+        }
+        clawd_completion_free(&result);
+        clawd_message_free(msg_list);
+        clawd_provider_free(provider);
+    }
+    response_content = agent_response ? agent_response
+        : "[clawd-gateway] Provider call failed.";
+#else
+    (void)max_tokens;
+    response_content = "[clawd-gateway] Request received. "
+                       "Agent processing not yet connected.";
+#endif
 
     cJSON *resp_obj = cJSON_CreateObject();
     cJSON_AddStringToObject(resp_obj, "id",
                             sess ? sess->id : "sess_unknown");
     cJSON_AddStringToObject(resp_obj, "object", "chat.completion");
     cJSON_AddNumberToObject(resp_obj, "created", (double)time(NULL));
-    cJSON_AddStringToObject(resp_obj, "model",
-                            model ? model : (g_cfg.model.default_model
-                                                 ? g_cfg.model.default_model
-                                                 : "claude-sonnet-4-20250514"));
+    cJSON_AddStringToObject(resp_obj, "model", effective_model);
 
     cJSON *choices = cJSON_AddArrayToObject(resp_obj, "choices");
     cJSON *choice = cJSON_CreateObject();
@@ -222,26 +338,24 @@ static enum MHD_Result handle_chat_completions(
 
     cJSON *message = cJSON_CreateObject();
     cJSON_AddStringToObject(message, "role", "assistant");
-    /*
-     * TODO: This is the integration point where we would call into the
-     * agents library to generate an actual response.  For now we return
-     * a placeholder that confirms the gateway is operational.
-     */
-    cJSON_AddStringToObject(message, "content",
-                            "[clawd-gateway] Request received. "
-                            "Agent processing not yet connected.");
+    cJSON_AddStringToObject(message, "content", response_content);
     cJSON_AddItemToObject(choice, "message", message);
     cJSON_AddStringToObject(choice, "finish_reason", "stop");
     cJSON_AddItemToArray(choices, choice);
 
     cJSON *usage = cJSON_AddObjectToObject(resp_obj, "usage");
-    cJSON_AddNumberToObject(usage, "prompt_tokens", 0);
-    cJSON_AddNumberToObject(usage, "completion_tokens", 0);
-    cJSON_AddNumberToObject(usage, "total_tokens", 0);
+    cJSON_AddNumberToObject(usage, "prompt_tokens", prompt_tokens);
+    cJSON_AddNumberToObject(usage, "completion_tokens", completion_tokens);
+    cJSON_AddNumberToObject(usage, "total_tokens",
+                            prompt_tokens + completion_tokens);
 
     struct MHD_Response *resp = json_success_response(resp_obj);
     cJSON_Delete(resp_obj);
     cJSON_Delete(req);
+
+#ifdef HAVE_AGENTS
+    free(agent_response);
+#endif
 
     enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
     MHD_destroy_response(resp);
@@ -281,36 +395,75 @@ static enum MHD_Result handle_messages(
                cJSON_GetArraySize(messages));
 
     gateway_session_t *sess = session_create();
+    const char *effective_model = model ? model
+        : (g_cfg.model.default_model ? g_cfg.model.default_model
+               : "claude-sonnet-4-20250514");
+    const char *response_text = NULL;
+    const char *stop_reason = "end_turn";
+    int input_tokens = 0;
+    int output_tokens = 0;
 
-    /* Build an Anthropic-format response. */
+#ifdef HAVE_AGENTS
+    clawd_provider_type_t ptype = resolve_provider_type(
+        g_cfg.model.default_provider);
+    clawd_provider_t *provider = clawd_provider_new(ptype, g_cfg.model.api_key);
+    char *agent_response = NULL;
+    if (provider) {
+        clawd_message_t *msg_list = messages_from_json(messages);
+        const char *sys_prompt = extract_system_prompt(messages);
+        clawd_completion_opts_t opts = {
+            .model = effective_model, .messages = msg_list,
+            .system_prompt = sys_prompt, .max_tokens = max_tokens,
+            .temperature = g_cfg.model.temperature, .tools_json = NULL,
+            .stream = false, .stream_cb = NULL, .stream_userdata = NULL
+        };
+        clawd_completion_t result;
+        memset(&result, 0, sizeof(result));
+        if (clawd_provider_complete(provider, &opts, &result) == 0) {
+            agent_response = result.content; result.content = NULL;
+            input_tokens = result.input_tokens;
+            output_tokens = result.output_tokens;
+            if (result.stop_reason) stop_reason = result.stop_reason;
+        } else { CLAWD_ERROR("provider completion failed"); }
+        clawd_completion_free(&result);
+        clawd_message_free(msg_list);
+        clawd_provider_free(provider);
+    }
+    response_text = agent_response ? agent_response
+        : "[clawd-gateway] Provider call failed.";
+#else
+    (void)max_tokens;
+    response_text = "[clawd-gateway] Request received. "
+                    "Agent processing not yet connected.";
+#endif
+
     cJSON *resp_obj = cJSON_CreateObject();
     cJSON_AddStringToObject(resp_obj, "id",
                             sess ? sess->id : "msg_unknown");
     cJSON_AddStringToObject(resp_obj, "type", "message");
     cJSON_AddStringToObject(resp_obj, "role", "assistant");
-    cJSON_AddStringToObject(resp_obj, "model",
-                            model ? model : (g_cfg.model.default_model
-                                                 ? g_cfg.model.default_model
-                                                 : "claude-sonnet-4-20250514"));
+    cJSON_AddStringToObject(resp_obj, "model", effective_model);
 
     cJSON *content = cJSON_AddArrayToObject(resp_obj, "content");
     cJSON *block = cJSON_CreateObject();
     cJSON_AddStringToObject(block, "type", "text");
-    cJSON_AddStringToObject(block, "text",
-                            "[clawd-gateway] Request received. "
-                            "Agent processing not yet connected.");
+    cJSON_AddStringToObject(block, "text", response_text);
     cJSON_AddItemToArray(content, block);
 
-    cJSON_AddStringToObject(resp_obj, "stop_reason", "end_turn");
+    cJSON_AddStringToObject(resp_obj, "stop_reason", stop_reason);
     cJSON_AddNullToObject(resp_obj, "stop_sequence");
 
     cJSON *usage = cJSON_AddObjectToObject(resp_obj, "usage");
-    cJSON_AddNumberToObject(usage, "input_tokens", 0);
-    cJSON_AddNumberToObject(usage, "output_tokens", 0);
+    cJSON_AddNumberToObject(usage, "input_tokens", input_tokens);
+    cJSON_AddNumberToObject(usage, "output_tokens", output_tokens);
 
     struct MHD_Response *resp = json_success_response(resp_obj);
     cJSON_Delete(resp_obj);
     cJSON_Delete(req);
+
+#ifdef HAVE_AGENTS
+    free(agent_response);
+#endif
 
     enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
     MHD_destroy_response(resp);
@@ -324,7 +477,7 @@ static enum MHD_Result handle_health(struct MHD_Connection *conn)
     cJSON *obj = cJSON_CreateObject();
     cJSON_AddStringToObject(obj, "status", "ok");
     cJSON_AddStringToObject(obj, "version", CLAWD_GATEWAY_VERSION);
-    cJSON_AddNumberToObject(obj, "uptime", 0); /* TODO: track uptime */
+    cJSON_AddNumberToObject(obj, "uptime", (double)(time(NULL) - g_start_time));
     cJSON_AddNumberToObject(obj, "active_sessions",
                             (double)session_count_active());
 
@@ -395,22 +548,59 @@ static enum MHD_Result handle_agent_chat(
     bool use_tools = clawd_json_get_bool(req, "use_tools", true);
 
     (void)session_id;
-    (void)use_tools;
 
     CLAWD_INFO("agent/chat: message_len=%zu, use_tools=%s",
                strlen(message), use_tools ? "true" : "false");
 
-    /* TODO: Route to agent library for processing with tool use. */
+    const char *response_content = NULL;
+    const char *stop_reason = "end_turn";
+
+#ifdef HAVE_AGENTS
+    clawd_provider_type_t ptype = resolve_provider_type(
+        g_cfg.model.default_provider);
+    clawd_provider_t *provider = clawd_provider_new(ptype, g_cfg.model.api_key);
+    char *agent_response = NULL;
+    if (provider) {
+        clawd_tool_ctx_t *tools = NULL;
+        if (use_tools) {
+            tools = clawd_tool_ctx_new("/tmp/clawd-workspace");
+            if (tools) clawd_tool_register_defaults(tools);
+        }
+        clawd_agent_opts_t agent_opts = {
+            .provider = provider, .tools = tools, .system_prompt = NULL,
+            .max_turns = 10, .sandbox_tools = g_cfg.security.sandbox_enabled,
+            .on_stream = NULL, .stream_userdata = NULL
+        };
+        clawd_agent_t *agent = clawd_agent_new(&agent_opts);
+        if (agent) {
+            if (clawd_agent_chat(agent, message, &agent_response) == 0)
+                response_content = agent_response;
+            else CLAWD_ERROR("agent chat failed");
+            clawd_agent_free(agent);
+        }
+        clawd_tool_ctx_free(tools);
+        clawd_provider_free(provider);
+    }
+    if (!response_content)
+        response_content = "[clawd-gateway] Agent call failed.";
+#else
+    (void)use_tools;
+    response_content = "[clawd-gateway] Agent chat received. "
+                       "Tool-use routing not yet connected.";
+#endif
+
     cJSON *resp_obj = cJSON_CreateObject();
     cJSON_AddStringToObject(resp_obj, "role", "assistant");
-    cJSON_AddStringToObject(resp_obj, "content",
-                            "[clawd-gateway] Agent chat received. "
-                            "Tool-use routing not yet connected.");
-    cJSON_AddStringToObject(resp_obj, "stop_reason", "end_turn");
+    cJSON_AddStringToObject(resp_obj, "content", response_content);
+    cJSON_AddStringToObject(resp_obj, "stop_reason", stop_reason);
 
     struct MHD_Response *resp = json_success_response(resp_obj);
     cJSON_Delete(resp_obj);
     cJSON_Delete(req);
+
+#ifdef HAVE_AGENTS
+    free(agent_response);
+#endif
 
     enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
     MHD_destroy_response(resp);
@@ -674,18 +864,47 @@ static void unix_client_handle(int client_fd)
         } else {
             CLAWD_INFO("chat.send: len=%zu", strlen(message));
 
-            /* TODO: Route to agent library for actual processing. */
+#ifdef HAVE_AGENTS
+            clawd_provider_type_t ptype = resolve_provider_type(
+                g_cfg.model.default_provider);
+            clawd_provider_t *provider = clawd_provider_new(ptype,
+                g_cfg.model.api_key);
+            char *agent_response = NULL;
+            if (provider) {
+                clawd_agent_opts_t aopts = {
+                    .provider = provider, .tools = NULL, .system_prompt = NULL,
+                    .max_turns = 10, .sandbox_tools = g_cfg.security.sandbox_enabled,
+                    .on_stream = NULL, .stream_userdata = NULL
+                };
+                clawd_agent_t *agent = clawd_agent_new(&aopts);
+                if (agent) {
+                    clawd_agent_chat(agent, message, &agent_response);
+                    clawd_agent_free(agent);
+                }
+                clawd_provider_free(provider);
+            }
+            cJSON *result = cJSON_AddObjectToObject(resp, "result");
+            cJSON_AddStringToObject(result, "content",
+                agent_response ? agent_response
+                    : "[clawd-gateway] Agent call failed.");
+            cJSON_AddStringToObject(result, "role", "assistant");
+            cJSON_AddStringToObject(result, "stop_reason", "end_turn");
+            free(agent_response);
+#else
             cJSON *result = cJSON_AddObjectToObject(resp, "result");
             cJSON_AddStringToObject(result, "content",
                                     "[clawd-gateway] Message received. "
                                     "Agent processing not yet connected.");
             cJSON_AddStringToObject(result, "role", "assistant");
             cJSON_AddStringToObject(result, "stop_reason", "end_turn");
+#endif
         }
     } else if (strcmp(method, "health") == 0) {
         cJSON *result = cJSON_AddObjectToObject(resp, "result");
         cJSON_AddStringToObject(result, "status", "ok");
         cJSON_AddStringToObject(result, "version", CLAWD_GATEWAY_VERSION);
+        cJSON_AddNumberToObject(result, "uptime",
+                                (double)(time(NULL) - g_start_time));
         cJSON_AddNumberToObject(result, "active_sessions",
                                 (double)session_count_active());
     } else if (strcmp(method, "config.get") == 0) {
@@ -1103,6 +1322,9 @@ int main(int argc, char **argv)
         }
     }
 
+    /* WebSocket port: HTTP port + 1. */
+    g_ws_port = g_port + 1;
+
     /* Initialize logging. */
     int log_level = g_cfg.logging.level >= 0 ? g_cfg.logging.level : CLAWD_LOG_INFO;
     clawd_log_init("clawd-gateway", log_level);
@@ -1166,6 +1388,9 @@ int main(int argc, char **argv)
         sigaction(SIGTERM, &sa, NULL);
         sigaction(SIGINT, &sa, NULL);
     }
+
+    /* Record start time for uptime tracking. */
+    g_start_time = time(NULL);
 
     CLAWD_INFO("clawd-gateway %s starting", CLAWD_GATEWAY_VERSION);
     CLAWD_INFO("HTTP: %s:%d", g_listen_addr, g_port);

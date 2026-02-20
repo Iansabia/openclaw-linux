@@ -7,6 +7,14 @@ set(CLAWD_TERMINAL_SOURCES
     src/ansi.c
     src/table.c
     src/progress.c
+    src/prompt.c
+)
+
+set(CLAWD_TERMINAL_HEADERS
+    include/clawd/ansi.h
+    include/clawd/table.h
+    include/clawd/progress.h
+    include/clawd/prompt.h
 )
 
 # ---- library target ------------------------------------------------------

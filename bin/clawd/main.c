@@ -39,7 +39,11 @@
 #include <unistd.h>
 
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
+
+#include <fcntl.h>
+#include <poll.h>
 
 #include <readline/readline.h>
 #include <readline/history.h>
@@ -192,14 +196,262 @@ static char *gateway_rpc(int fd, const char *method, cJSON *params)
 }
 
 /**
- * Send a chat message via JSON-RPC and stream the response tokens to stdout.
+ * Send a JSON-RPC request for a chat message.
+ * This is a lower-level helper that sends the request but does not read the
+ * response, allowing the caller to handle streaming reads separately.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+static int gateway_send_chat_request(int fd, const char *message, bool stream)
+{
+    static int rpc_id = 1000;
+
+    cJSON *params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "message", message);
+    cJSON_AddBoolToObject(params, "stream", stream);
+
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddStringToObject(req, "jsonrpc", "2.0");
+    cJSON_AddNumberToObject(req, "id", rpc_id++);
+    cJSON_AddStringToObject(req, "method", "chat.send");
+    cJSON_AddItemToObject(req, "params", params);
+
+    char *payload = cJSON_PrintUnformatted(req);
+    cJSON_Delete(req);
+    if (!payload)
+        return -1;
+
+    size_t plen = strlen(payload);
+    char *sendbuf = malloc(plen + 2);
+    if (!sendbuf) {
+        free(payload);
+        return -1;
+    }
+    memcpy(sendbuf, payload, plen);
+    sendbuf[plen]     = '\n';
+    sendbuf[plen + 1] = '\0';
+    free(payload);
+
+    ssize_t sent = 0;
+    ssize_t total = (ssize_t)(plen + 1);
+    while (sent < total) {
+        ssize_t n = write(fd, sendbuf + sent, (size_t)(total - sent));
+        if (n <= 0) {
+            free(sendbuf);
+            return -1;
+        }
+        sent += n;
+    }
+    free(sendbuf);
+    return 0;
+}
+
+/**
+ * Read streaming token chunks from the gateway and print them to stdout.
+ *
+ * The gateway sends newline-delimited JSON chunks.  Each chunk is either:
+ *   - A streaming delta:  {"type":"delta","content":"..."}
+ *   - A done sentinel:    {"type":"done"}  or the literal string [DONE]
+ *   - A complete JSON-RPC response (non-streaming fallback)
+ *
+ * Uses poll() with a timeout to avoid blocking indefinitely.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+static int gateway_read_streaming(int fd)
+{
+    bool got_output   = false;
+    bool style_active = false;
+
+    /* Apply styling for the entire streamed response. */
+    if (g_color && clawd_ansi_is_tty(stdout)) {
+        clawd_ansi_style(stdout, CLAWD_STYLE_BOLD);
+        clawd_ansi_color(stdout, CLAWD_COLOR_BRIGHT_WHITE);
+        style_active = true;
+    }
+
+    /* Line buffer: accumulate bytes until we see a newline. */
+    clawd_str_t linebuf = clawd_str_new();
+    char readbuf[4096];
+    int  rc = 0;
+
+    struct pollfd pfd;
+    pfd.fd     = fd;
+    pfd.events = POLLIN;
+
+    for (;;) {
+        /* Poll with a 30-second timeout. */
+        int prc = poll(&pfd, 1, 30000);
+        if (prc < 0) {
+            if (errno == EINTR)
+                continue;
+            if (!g_quiet)
+                fprintf(stderr, "clawd: poll(): %s\n", strerror(errno));
+            rc = -1;
+            break;
+        }
+        if (prc == 0) {
+            /* Timeout waiting for data. */
+            if (!g_quiet)
+                fprintf(stderr, "\nclawd: timeout waiting for gateway response\n");
+            rc = -1;
+            break;
+        }
+
+        ssize_t n = read(fd, readbuf, sizeof(readbuf) - 1);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN)
+                continue;
+            if (!g_quiet)
+                fprintf(stderr, "clawd: read(): %s\n", strerror(errno));
+            rc = -1;
+            break;
+        }
+        if (n == 0) {
+            /* EOF -- gateway closed the connection. */
+            break;
+        }
+
+        /* Append to line buffer and process complete lines. */
+        clawd_str_append(&linebuf, readbuf, (size_t)n);
+
+        /* Process each newline-delimited chunk in the buffer. */
+        char *start = linebuf.data;
+        char *nl;
+        while ((nl = strchr(start, '\n')) != NULL) {
+            *nl = '\0';
+
+            /* Skip empty lines. */
+            if (*start == '\0') {
+                start = nl + 1;
+                continue;
+            }
+
+            /* Check for [DONE] sentinel. */
+            if (strcmp(start, "[DONE]") == 0) {
+                start = nl + 1;
+                goto done;
+            }
+
+            /* Parse the JSON chunk. */
+            cJSON *chunk = clawd_json_parse(start);
+            if (!chunk) {
+                /* Unparseable line -- skip it. */
+                start = nl + 1;
+                continue;
+            }
+
+            /* Check for a streaming delta. */
+            const char *type = clawd_json_get_string(chunk, "type");
+            if (type && strcmp(type, "done") == 0) {
+                cJSON_Delete(chunk);
+                start = nl + 1;
+                goto done;
+            }
+
+            if (type && strcmp(type, "delta") == 0) {
+                const char *content = clawd_json_get_string(chunk, "content");
+                if (content) {
+                    fputs(content, stdout);
+                    fflush(stdout);
+                    got_output = true;
+                }
+                cJSON_Delete(chunk);
+                start = nl + 1;
+                continue;
+            }
+
+            /* Check for error in a streaming chunk. */
+            if (type && strcmp(type, "error") == 0) {
+                const char *emsg = clawd_json_get_string(chunk, "message");
+                fprintf(stderr, "clawd: stream error: %s\n",
+                        emsg ? emsg : "unknown");
+                cJSON_Delete(chunk);
+                rc = -1;
+                start = nl + 1;
+                goto done;
+            }
+
+            /*
+             * Fallback: this might be a complete JSON-RPC response
+             * (non-streaming mode).  Handle it like the old code path.
+             */
+            cJSON *error_obj = cJSON_GetObjectItem(chunk, "error");
+            if (error_obj) {
+                const char *msg = clawd_json_get_string(error_obj, "message");
+                fprintf(stderr, "clawd: gateway error: %s\n",
+                        msg ? msg : "unknown");
+                cJSON_Delete(chunk);
+                rc = -1;
+                start = nl + 1;
+                goto done;
+            }
+
+            cJSON *result = cJSON_GetObjectItem(chunk, "result");
+            if (result) {
+                const char *text = clawd_json_get_string(result, "content");
+                if (text) {
+                    fputs(text, stdout);
+                    fflush(stdout);
+                    got_output = true;
+                }
+                cJSON_Delete(chunk);
+                start = nl + 1;
+                goto done;
+            }
+
+            cJSON_Delete(chunk);
+            start = nl + 1;
+        }
+
+        /* Compact the line buffer: move remaining data to front. */
+        if (start != linebuf.data) {
+            size_t remaining = (size_t)(linebuf.data + linebuf.len - start);
+            if (remaining > 0)
+                memmove(linebuf.data, start, remaining);
+            linebuf.len = remaining;
+            linebuf.data[linebuf.len] = '\0';
+        }
+    }
+
+done:
+    if (style_active)
+        clawd_ansi_reset(stdout);
+    if (got_output)
+        fputc('\n', stdout);
+    fflush(stdout);
+    clawd_str_free(&linebuf);
+    return rc;
+}
+
+/**
+ * Send a chat message via JSON-RPC and display the response.
+ *
+ * When @p stream_to_stdout is true, reads the response incrementally as
+ * newline-delimited JSON chunks (one per token/event) and prints each
+ * content delta immediately to stdout with fflush() for real-time display.
+ *
+ * When @p stream_to_stdout is false, falls back to a single blocking
+ * gateway_rpc() call and prints the complete result.
+ *
  * Returns 0 on success, -1 on error.
  */
 static int gateway_chat(int fd, const char *message, bool stream_to_stdout)
 {
+    if (stream_to_stdout) {
+        /* Streaming mode: send request, then incrementally read chunks. */
+        if (gateway_send_chat_request(fd, message, true) != 0) {
+            if (!g_quiet)
+                fprintf(stderr, "clawd: failed to send request\n");
+            return -1;
+        }
+        return gateway_read_streaming(fd);
+    }
+
+    /* Non-streaming mode: use the blocking RPC helper. */
     cJSON *params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "message", message);
-    cJSON_AddBoolToObject(params, "stream", stream_to_stdout);
+    cJSON_AddBoolToObject(params, "stream", false);
 
     char *resp_str = gateway_rpc(fd, "chat.send", params);
     cJSON_Delete(params);
@@ -364,17 +616,44 @@ static int cmd_chat(int argc, char **argv)
 
 static int cmd_ask(int argc, char **argv)
 {
-    if (argc < 1) {
-        fprintf(stderr, "Usage: clawd ask <question>\n");
-        return 1;
-    }
-
-    /* Join all remaining args into a single question string. */
+    /* Join all args into a question string (may be empty if piping). */
     clawd_str_t question = clawd_str_new();
     for (int i = 0; i < argc; i++) {
         if (i > 0)
             clawd_str_append_cstr(&question, " ");
         clawd_str_append_cstr(&question, argv[i]);
+    }
+
+    /*
+     * If stdin is not a TTY (piped input), read all of stdin and append it
+     * to the question.  This enables usage like:
+     *   echo "explain this" | clawd ask
+     *   cat file.c | clawd ask "review this code"
+     */
+    if (!isatty(STDIN_FILENO)) {
+        clawd_str_t stdin_buf = clawd_str_new();
+        char buf[4096];
+        for (;;) {
+            ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+            if (n <= 0)
+                break;
+            clawd_str_append(&stdin_buf, buf, (size_t)n);
+        }
+
+        if (stdin_buf.len > 0) {
+            /* Separate the argv question from piped content. */
+            if (question.len > 0)
+                clawd_str_append_cstr(&question, "\n\n");
+            clawd_str_append(&question, stdin_buf.data, stdin_buf.len);
+        }
+        clawd_str_free(&stdin_buf);
+    }
+
+    if (question.len == 0) {
+        fprintf(stderr, "Usage: clawd ask <question>\n");
+        fprintf(stderr, "       echo \"text\" | clawd ask\n");
+        clawd_str_free(&question);
+        return 1;
     }
 
     const char *sock_path = g_cfg.gateway.socket_path;
@@ -645,9 +924,7 @@ static int cmd_config(int argc, char **argv)
             fprintf(stderr, "Usage: clawd config set <key> <value>\n");
             return 1;
         }
-        /* Configuration set requires modifying the YAML config file.
-         * For now, we provide guidance. A full implementation would parse
-         * and rewrite the config file. */
+
         const char *key   = argv[1];
         const char *value = argv[2];
 
@@ -657,40 +934,281 @@ static int cmd_config(int argc, char **argv)
             return 1;
         }
 
+        /* Ensure the config directory exists before writing. */
+        clawd_paths_ensure_dirs();
+
+        /*
+         * Determine the config file path and format.
+         * Check for JSON first, fall back to YAML.
+         */
+        char filepath_json[512];
+        char filepath_yaml[512];
         char filepath[512];
-        snprintf(filepath, sizeof(filepath), "%s/clawd.yaml", config_dir);
+        snprintf(filepath_json, sizeof(filepath_json),
+                 "%s/clawd.json", config_dir);
+        snprintf(filepath_yaml, sizeof(filepath_yaml),
+                 "%s/clawd.yaml", config_dir);
         free(config_dir);
 
-        /* Open file for appending the override as a comment + value. */
-        FILE *f = fopen(filepath, "a");
-        if (!f) {
-            fprintf(stderr, "clawd: cannot open %s: %s\n",
-                    filepath, strerror(errno));
-            return 1;
-        }
+        struct stat st;
+        bool is_json = (stat(filepath_json, &st) == 0 && S_ISREG(st.st_mode));
+        snprintf(filepath, sizeof(filepath), "%s",
+                 is_json ? filepath_json : filepath_yaml);
 
-        /* Write a dotted-key override line.
-         * A real implementation would use a YAML library to do proper editing.
-         * For now we append a commented instruction. */
-        fprintf(f, "\n# Set by 'clawd config set %s %s'\n", key, value);
+        if (is_json) {
+            /* ---- JSON config: parse with cJSON, modify, rewrite ---- */
+            cJSON *root = NULL;
 
-        /* Convert dotted key to nested YAML. */
-        int nparts = 0;
-        char **parts = clawd_str_split(key, '.', &nparts);
-        if (parts && nparts > 0) {
-            for (int i = 0; i < nparts; i++) {
-                for (int j = 0; j < i; j++)
-                    fprintf(f, "  ");
-                if (i < nparts - 1)
-                    fprintf(f, "%s:\n", parts[i]);
-                else
-                    fprintf(f, "%s: %s\n", parts[i], value);
-                free(parts[i]);
+            FILE *rf = fopen(filepath, "r");
+            if (rf) {
+                fseek(rf, 0, SEEK_END);
+                long fsize = ftell(rf);
+                fseek(rf, 0, SEEK_SET);
+                if (fsize > 0) {
+                    char *json_str = malloc((size_t)fsize + 1);
+                    if (json_str) {
+                        size_t nread = fread(json_str, 1, (size_t)fsize, rf);
+                        json_str[nread] = '\0';
+                        root = cJSON_Parse(json_str);
+                        free(json_str);
+                    }
+                }
+                fclose(rf);
             }
-            free(parts);
-        }
 
-        fclose(f);
+            if (!root)
+                root = cJSON_CreateObject();
+
+            /*
+             * Navigate / create nested objects for dotted key path.
+             * E.g. "gateway.port" -> root["gateway"]["port"]
+             */
+            int nparts = 0;
+            char **parts = clawd_str_split(key, '.', &nparts);
+            if (parts && nparts > 0) {
+                cJSON *node = root;
+                for (int i = 0; i < nparts - 1; i++) {
+                    cJSON *child = cJSON_GetObjectItem(node, parts[i]);
+                    if (!child) {
+                        child = cJSON_CreateObject();
+                        cJSON_AddItemToObject(node, parts[i], child);
+                    }
+                    node = child;
+                }
+
+                /* Set the leaf value (auto-detect type). */
+                const char *leaf = parts[nparts - 1];
+                cJSON_DeleteItemFromObject(node, leaf);
+
+                /* Try parsing as integer. */
+                char *endp = NULL;
+                long lval = strtol(value, &endp, 10);
+                if (endp && *endp == '\0' && endp != value) {
+                    cJSON_AddNumberToObject(node, leaf, (double)lval);
+                } else if (strcmp(value, "true") == 0) {
+                    cJSON_AddBoolToObject(node, leaf, 1);
+                } else if (strcmp(value, "false") == 0) {
+                    cJSON_AddBoolToObject(node, leaf, 0);
+                } else {
+                    cJSON_AddStringToObject(node, leaf, value);
+                }
+
+                for (int i = 0; i < nparts; i++)
+                    free(parts[i]);
+                free(parts);
+            }
+
+            /* Write the modified JSON back. */
+            char *output = cJSON_Print(root);
+            cJSON_Delete(root);
+            if (!output) {
+                fprintf(stderr, "clawd: failed to serialize config\n");
+                return 1;
+            }
+
+            FILE *wf = fopen(filepath, "w");
+            if (!wf) {
+                fprintf(stderr, "clawd: cannot write %s: %s\n",
+                        filepath, strerror(errno));
+                free(output);
+                return 1;
+            }
+            fputs(output, wf);
+            fputc('\n', wf);
+            fclose(wf);
+            free(output);
+
+        } else {
+            /*
+             * ---- YAML config: line-based in-place editing ----
+             *
+             * NOTE: A full YAML round-trip library (e.g. libyaml with
+             * emitter, or a tree-preserving library like yaml-cpp) would be
+             * ideal for production.  The approach below handles the common
+             * case of simple "section.key: value" edits without destroying
+             * comments or formatting, but it does not handle all YAML edge
+             * cases (flow style, multi-line values, anchors, etc.).
+             *
+             * Strategy:
+             *   - Split the dotted key into parts (e.g. "gateway" + "port").
+             *   - Read the file line by line, tracking indentation depth.
+             *   - Find the target section and key line, replace its value.
+             *   - If the key does not exist, append properly indented YAML.
+             */
+            int nparts = 0;
+            char **parts = clawd_str_split(key, '.', &nparts);
+            if (!parts || nparts == 0) {
+                fprintf(stderr, "clawd: invalid key '%s'\n", key);
+                return 1;
+            }
+
+            /* Read existing file content (may not exist yet). */
+            clawd_buf_t fbuf = clawd_buf_new(0);
+            (void)clawd_buf_read_file(&fbuf, filepath);
+
+            /* Split into lines. */
+            clawd_str_t content_str = clawd_str_new();
+            if (fbuf.len > 0)
+                clawd_str_append(&content_str, (const char *)fbuf.data,
+                                 fbuf.len);
+            clawd_buf_free(&fbuf);
+
+            /* Parse lines. */
+            int line_count = 0;
+            char **lines = clawd_str_split(
+                content_str.data ? content_str.data : "", '\n', &line_count);
+            clawd_str_free(&content_str);
+
+            /*
+             * Search for the target key by walking the YAML structure.
+             * For a key like "gateway.port", we look for a line "gateway:"
+             * at indent 0, then "port:" at indent 2 within that section.
+             */
+            bool found = false;
+            int target_line = -1;
+            int depth = 0;            /* current search depth in parts[] */
+            int section_indent = -1;  /* indent of the current section   */
+
+            for (int li = 0; li < line_count && !found; li++) {
+                const char *ln = lines[li];
+
+                /* Measure leading spaces. */
+                int indent = 0;
+                while (ln[indent] == ' ')
+                    indent++;
+
+                /* Skip blank lines and comments. */
+                if (ln[indent] == '\0' || ln[indent] == '#')
+                    continue;
+
+                /* If we're inside a section and indent drops back, we left. */
+                if (depth > 0 && indent <= section_indent) {
+                    /* Reset: the section ended without finding the key. */
+                    depth = 0;
+                    section_indent = -1;
+                }
+
+                int expected_indent = depth * 2;
+
+                if (indent == expected_indent) {
+                    /* Build the pattern we're looking for. */
+                    char pattern[256];
+                    snprintf(pattern, sizeof(pattern), "%s:", parts[depth]);
+                    size_t plen = strlen(pattern);
+
+                    /* Check if this line starts with the pattern. */
+                    if (strncmp(ln + indent, pattern, plen) == 0) {
+                        char after = ln[indent + (int)plen];
+                        if (after == ' ' || after == '\0' || after == '\n') {
+                            if (depth == nparts - 1) {
+                                /* Found the leaf key -- replace this line. */
+                                target_line = li;
+                                found = true;
+                            } else {
+                                /* Found an intermediate section -- go deeper. */
+                                section_indent = indent;
+                                depth++;
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* Rebuild the file content. */
+            clawd_str_t output = clawd_str_new();
+
+            if (found && target_line >= 0) {
+                /* Replace the target line. */
+                for (int li = 0; li < line_count; li++) {
+                    if (li == target_line) {
+                        /* Preserve the original indentation. */
+                        int indent = 0;
+                        while (lines[li][indent] == ' ')
+                            indent++;
+                        for (int s = 0; s < indent; s++)
+                            clawd_str_append_cstr(&output, " ");
+                        clawd_str_printf(&output, "%s: %s",
+                                         parts[nparts - 1], value);
+                    } else {
+                        clawd_str_append_cstr(&output, lines[li]);
+                    }
+                    /* Add newline between lines (not after last). */
+                    if (li < line_count - 1)
+                        clawd_str_append_cstr(&output, "\n");
+                }
+                /* Preserve trailing newline if the original had one. */
+                if (line_count > 0 && lines[line_count - 1][0] == '\0')
+                    clawd_str_append_cstr(&output, "\n");
+            } else {
+                /* Key not found: keep existing content and append. */
+                for (int li = 0; li < line_count; li++) {
+                    clawd_str_append_cstr(&output, lines[li]);
+                    if (li < line_count - 1)
+                        clawd_str_append_cstr(&output, "\n");
+                }
+
+                /* Ensure a trailing newline before appending. */
+                if (output.len > 0 &&
+                    output.data[output.len - 1] != '\n')
+                    clawd_str_append_cstr(&output, "\n");
+
+                clawd_str_append_cstr(&output, "\n");
+                clawd_str_printf(&output,
+                    "# Set by 'clawd config set %s %s'\n", key, value);
+
+                /* Write the nested YAML with proper indentation. */
+                for (int i = 0; i < nparts; i++) {
+                    for (int j = 0; j < i; j++)
+                        clawd_str_append_cstr(&output, "  ");
+                    if (i < nparts - 1)
+                        clawd_str_printf(&output, "%s:\n", parts[i]);
+                    else
+                        clawd_str_printf(&output, "%s: %s\n", parts[i],
+                                         value);
+                }
+            }
+
+            /* Free the split lines. */
+            for (int li = 0; li < line_count; li++)
+                free(lines[li]);
+            free(lines);
+            for (int i = 0; i < nparts; i++)
+                free(parts[i]);
+            free(parts);
+
+            /* Write the output file. */
+            FILE *wf = fopen(filepath, "w");
+            if (!wf) {
+                fprintf(stderr, "clawd: cannot write %s: %s\n",
+                        filepath, strerror(errno));
+                clawd_str_free(&output);
+                return 1;
+            }
+            if (output.len > 0)
+                fwrite(output.data, 1, output.len, wf);
+            fclose(wf);
+            clawd_str_free(&output);
+        }
 
         if (!g_quiet)
             printf("Set %s = %s in %s\n", key, value, filepath);

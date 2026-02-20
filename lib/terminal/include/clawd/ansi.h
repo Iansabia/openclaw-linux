@@ -111,6 +111,34 @@ void clawd_ansi_cursor_up(FILE *fp, int n);
 void clawd_ansi_cursor_down(FILE *fp, int n);
 
 /**
+ * Move the cursor left by @p n columns.
+ */
+void clawd_ansi_cursor_left(FILE *fp, int n);
+
+/**
+ * Move the cursor right by @p n columns.
+ */
+void clawd_ansi_cursor_right(FILE *fp, int n);
+
+/**
+ * Move the cursor to an absolute column position.
+ *
+ * @param fp   Output stream.
+ * @param col  Column number (1-based).
+ */
+void clawd_ansi_cursor_col(FILE *fp, int col);
+
+/**
+ * Hide the cursor.
+ */
+void clawd_ansi_cursor_hide(FILE *fp);
+
+/**
+ * Show the cursor.
+ */
+void clawd_ansi_cursor_show(FILE *fp);
+
+/**
  * Save the current cursor position (DECSC).
  */
 void clawd_ansi_cursor_save(FILE *fp);
@@ -139,10 +167,12 @@ void clawd_ansi_clear_screen(FILE *fp);
 char *clawd_ansi_strip(const char *s);
 
 /**
- * Compute the visible (display) length of @p s, ignoring ANSI escape sequences.
+ * Compute the visible (display) length of @p s, ignoring ANSI escape
+ * sequences.  Uses wcwidth() to correctly account for wide characters
+ * (CJK ideographs take 2 columns) and combining marks (0 columns).
  *
  * @param s  The string to measure.
- * @return Number of visible characters.
+ * @return Number of terminal display columns.
  */
 size_t clawd_ansi_strlen(const char *s);
 

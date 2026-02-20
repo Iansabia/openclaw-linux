@@ -6,6 +6,7 @@
  */
 
 #include <assert.h>
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +15,7 @@
 #include <clawd/table.h>
 #include <clawd/progress.h>
 
-/* ---- ANSI tests --------------------------------------------------------- */
+/* ---- ANSI strip tests --------------------------------------------------- */
 
 static void test_ansi_strip_plain(void)
 {
@@ -72,6 +73,46 @@ static void test_ansi_strip_empty(void)
     printf("  PASS: ansi_strip empty string\n");
 }
 
+static void test_ansi_strip_osc(void)
+{
+    /* OSC sequence terminated by BEL */
+    char *out = clawd_ansi_strip("\033]0;title\007visible");
+    assert(out != NULL);
+    assert(strcmp(out, "visible") == 0);
+    free(out);
+    printf("  PASS: ansi_strip OSC sequence (BEL)\n");
+}
+
+static void test_ansi_strip_osc_st(void)
+{
+    /* OSC sequence terminated by ST (ESC \) */
+    char *out = clawd_ansi_strip("\033]0;title\033\\visible");
+    assert(out != NULL);
+    assert(strcmp(out, "visible") == 0);
+    free(out);
+    printf("  PASS: ansi_strip OSC sequence (ST)\n");
+}
+
+static void test_ansi_strip_256color(void)
+{
+    /* 256-color code: ESC[38;5;196m */
+    char *out = clawd_ansi_strip("\033[38;5;196mred256\033[0m");
+    assert(out != NULL);
+    assert(strcmp(out, "red256") == 0);
+    free(out);
+    printf("  PASS: ansi_strip 256-color code\n");
+}
+
+static void test_ansi_strip_truecolor(void)
+{
+    /* True-color: ESC[38;2;255;0;0m */
+    char *out = clawd_ansi_strip("\033[38;2;255;0;0mtrue\033[0m");
+    assert(out != NULL);
+    assert(strcmp(out, "true") == 0);
+    free(out);
+    printf("  PASS: ansi_strip true-color code\n");
+}
+
 /* ---- ANSI strlen tests -------------------------------------------------- */
 
 static void test_ansi_strlen_plain(void)
@@ -100,6 +141,60 @@ static void test_ansi_strlen_complex(void)
     printf("  PASS: ansi_strlen complex\n");
 }
 
+static void test_ansi_strlen_ascii(void)
+{
+    /* Pure ASCII, each character is 1 column */
+    assert(clawd_ansi_strlen("abcdef") == 6);
+    assert(clawd_ansi_strlen("A") == 1);
+    assert(clawd_ansi_strlen("  ") == 2);
+    printf("  PASS: ansi_strlen ASCII characters\n");
+}
+
+static void test_ansi_strlen_cjk(void)
+{
+    /*
+     * CJK characters take 2 display columns each.
+     * U+4F60 (ni3) = 3 UTF-8 bytes, 2 columns
+     * U+597D (hao3) = 3 UTF-8 bytes, 2 columns
+     * "ni3 hao3" should be 4 columns total.
+     */
+    assert(clawd_ansi_strlen("\xe4\xbd\xa0\xe5\xa5\xbd") == 4);
+    printf("  PASS: ansi_strlen CJK characters\n");
+}
+
+static void test_ansi_strlen_cjk_mixed(void)
+{
+    /*
+     * Mixed ASCII and CJK:
+     * "hi" + CJK = 2 (ASCII) + 4 (CJK) = 6 columns
+     */
+    assert(clawd_ansi_strlen("hi\xe4\xbd\xa0\xe5\xa5\xbd") == 6);
+    printf("  PASS: ansi_strlen mixed ASCII+CJK\n");
+}
+
+static void test_ansi_strlen_emoji(void)
+{
+    /*
+     * Emoji U+1F600 (grinning face) = 4 UTF-8 bytes (F0 9F 98 80).
+     * wcwidth() typically returns 2 for emoji on most systems, though
+     * some may return 1 or -1.  We accept either 1 or 2 here as both
+     * are reasonable depending on locale support.
+     */
+    size_t w = clawd_ansi_strlen("\xf0\x9f\x98\x80");
+    assert(w >= 1 && w <= 2);
+    printf("  PASS: ansi_strlen emoji (width=%zu)\n", w);
+}
+
+static void test_ansi_strlen_cjk_with_ansi(void)
+{
+    /*
+     * CJK text wrapped in ANSI color codes:
+     * ESC[31m + CJK + ESC[0m = 4 columns (escape codes are zero-width)
+     */
+    assert(clawd_ansi_strlen("\033[31m\xe4\xbd\xa0\xe5\xa5\xbd\033[0m") == 4);
+    printf("  PASS: ansi_strlen CJK with ANSI codes\n");
+}
+
 /* ---- Table tests -------------------------------------------------------- */
 
 static void test_table_basic(void)
@@ -124,12 +219,12 @@ static void test_table_basic(void)
     assert(strstr(s, "City") != NULL);
 
     /* Check for box-drawing characters (UTF-8 encoded) */
-    assert(strstr(s, "\xe2\x94\x8c") != NULL);  /* ┌ */
-    assert(strstr(s, "\xe2\x94\x90") != NULL);  /* ┐ */
-    assert(strstr(s, "\xe2\x94\x94") != NULL);  /* └ */
-    assert(strstr(s, "\xe2\x94\x98") != NULL);  /* ┘ */
-    assert(strstr(s, "\xe2\x94\x82") != NULL);  /* │ */
-    assert(strstr(s, "\xe2\x94\x80") != NULL);  /* ─ */
+    assert(strstr(s, "\xe2\x94\x8c") != NULL);  /* top-left corner */
+    assert(strstr(s, "\xe2\x94\x90") != NULL);  /* top-right corner */
+    assert(strstr(s, "\xe2\x94\x94") != NULL);  /* bottom-left corner */
+    assert(strstr(s, "\xe2\x94\x98") != NULL);  /* bottom-right corner */
+    assert(strstr(s, "\xe2\x94\x82") != NULL);  /* vertical bar */
+    assert(strstr(s, "\xe2\x94\x80") != NULL);  /* horizontal bar */
 
     free(s);
     clawd_table_free(t);
@@ -274,6 +369,9 @@ static void test_spinner_null(void)
 
 int main(void)
 {
+    /* Ensure locale is set for wcwidth() to work correctly in tests */
+    setlocale(LC_ALL, "");
+
     printf("=== libclawd-terminal tests ===\n");
 
     printf("\n-- ANSI strip --\n");
@@ -283,12 +381,21 @@ int main(void)
     test_ansi_strip_cursor();
     test_ansi_strip_null();
     test_ansi_strip_empty();
+    test_ansi_strip_osc();
+    test_ansi_strip_osc_st();
+    test_ansi_strip_256color();
+    test_ansi_strip_truecolor();
 
     printf("\n-- ANSI strlen --\n");
     test_ansi_strlen_plain();
     test_ansi_strlen_color();
     test_ansi_strlen_empty();
     test_ansi_strlen_complex();
+    test_ansi_strlen_ascii();
+    test_ansi_strlen_cjk();
+    test_ansi_strlen_cjk_mixed();
+    test_ansi_strlen_emoji();
+    test_ansi_strlen_cjk_with_ansi();
 
     printf("\n-- Table --\n");
     test_table_basic();

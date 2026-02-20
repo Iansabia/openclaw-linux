@@ -11,6 +11,8 @@
 #include <clawd/sandbox.h>
 #include <clawd/log.h>
 
+#include "sandbox_internal.h"
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -23,10 +25,6 @@
 #include <fcntl.h>
 
 #define CGROUP_BASE "/sys/fs/cgroup/clawd"
-
-typedef struct clawd_cgroup {
-    char path[512];    /* /sys/fs/cgroup/clawd/sandbox-{id} */
-} clawd_cgroup_t;
 
 static int write_file(const char *path, const char *content)
 {
@@ -163,10 +161,6 @@ void clawd_cgroup_destroy(clawd_cgroup_t *cg)
 }
 
 #else /* !__linux__ */
-
-typedef struct clawd_cgroup {
-    int dummy;
-} clawd_cgroup_t;
 
 clawd_cgroup_t *clawd_cgroup_create(unsigned int sandbox_id)
 {

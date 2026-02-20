@@ -8,10 +8,12 @@
 #include <clawd/ansi.h>
 
 #include <ctype.h>
+#include <locale.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <wchar.h>
 
 /* ---- TTY detection ------------------------------------------------------ */
 
@@ -87,6 +89,36 @@ void clawd_ansi_cursor_down(FILE *fp, int n)
 {
     if (!fp || !clawd_ansi_is_tty(fp) || n <= 0) return;
     fprintf(fp, "\033[%dB", n);
+}
+
+void clawd_ansi_cursor_left(FILE *fp, int n)
+{
+    if (!fp || !clawd_ansi_is_tty(fp) || n <= 0) return;
+    fprintf(fp, "\033[%dD", n);
+}
+
+void clawd_ansi_cursor_right(FILE *fp, int n)
+{
+    if (!fp || !clawd_ansi_is_tty(fp) || n <= 0) return;
+    fprintf(fp, "\033[%dC", n);
+}
+
+void clawd_ansi_cursor_col(FILE *fp, int col)
+{
+    if (!fp || !clawd_ansi_is_tty(fp) || col <= 0) return;
+    fprintf(fp, "\033[%dG", col);
+}
+
+void clawd_ansi_cursor_hide(FILE *fp)
+{
+    if (!fp || !clawd_ansi_is_tty(fp)) return;
+    fprintf(fp, "\033[?25l");
+}
+
+void clawd_ansi_cursor_show(FILE *fp)
+{
+    if (!fp || !clawd_ansi_is_tty(fp)) return;
+    fprintf(fp, "\033[?25h");
 }
 
 void clawd_ansi_cursor_save(FILE *fp)
@@ -174,9 +206,74 @@ char *clawd_ansi_strip(const char *s)
     return out;
 }
 
+/*
+ * Ensure the C locale is initialized for multibyte/wide-char conversion.
+ * Called once via a simple flag; a harmless double-init of setlocale is
+ * acceptable.
+ */
+static void ensure_locale_init(void)
+{
+    static volatile int initialized = 0;
+    if (!initialized) {
+        setlocale(LC_CTYPE, "");
+        initialized = 1;
+    }
+}
+
+/*
+ * Decode a single UTF-8 codepoint starting at *p.
+ * Sets *bytes_consumed to the number of bytes read.
+ * Returns the Unicode codepoint, or (wchar_t)-1 on error.
+ */
+static wchar_t decode_utf8(const char *p, int *bytes_consumed)
+{
+    unsigned char c = (unsigned char)*p;
+
+    if (c < 0x80) {
+        *bytes_consumed = 1;
+        return (wchar_t)c;
+    } else if ((c & 0xE0) == 0xC0) {
+        if (((unsigned char)p[1] & 0xC0) != 0x80) {
+            *bytes_consumed = 1;
+            return (wchar_t)-1;
+        }
+        *bytes_consumed = 2;
+        return (wchar_t)(((c & 0x1F) << 6) |
+                         ((unsigned char)p[1] & 0x3F));
+    } else if ((c & 0xF0) == 0xE0) {
+        if (((unsigned char)p[1] & 0xC0) != 0x80 ||
+            ((unsigned char)p[2] & 0xC0) != 0x80) {
+            *bytes_consumed = 1;
+            return (wchar_t)-1;
+        }
+        *bytes_consumed = 3;
+        return (wchar_t)(((c & 0x0F) << 12) |
+                         (((unsigned char)p[1] & 0x3F) << 6) |
+                         ((unsigned char)p[2] & 0x3F));
+    } else if ((c & 0xF8) == 0xF0) {
+        if (((unsigned char)p[1] & 0xC0) != 0x80 ||
+            ((unsigned char)p[2] & 0xC0) != 0x80 ||
+            ((unsigned char)p[3] & 0xC0) != 0x80) {
+            *bytes_consumed = 1;
+            return (wchar_t)-1;
+        }
+        *bytes_consumed = 4;
+        return (wchar_t)(((c & 0x07) << 18) |
+                         (((unsigned char)p[1] & 0x3F) << 12) |
+                         (((unsigned char)p[2] & 0x3F) << 6) |
+                         ((unsigned char)p[3] & 0x3F));
+    }
+
+    /* Invalid leading byte */
+    *bytes_consumed = 1;
+    return (wchar_t)-1;
+}
+
 size_t clawd_ansi_strlen(const char *s)
 {
     if (!s) return 0;
+
+    ensure_locale_init();
 
     size_t len = 0;
     const char *p = s;
@@ -185,24 +282,26 @@ size_t clawd_ansi_strlen(const char *s)
         if (*p == '\033') {
             p = skip_ansi(p);
         } else {
-            /* Handle multi-byte UTF-8: count codepoints, not bytes. */
-            unsigned char c = (unsigned char)*p;
-            if (c < 0x80) {
+            /*
+             * Decode the UTF-8 codepoint and use wcwidth() to get the
+             * display width.  CJK characters return 2, ASCII returns 1,
+             * combining marks return 0.
+             */
+            int consumed = 1;
+            wchar_t wc = decode_utf8(p, &consumed);
+
+            if (wc == (wchar_t)-1) {
+                /* Invalid byte -- skip it, count as 1 column */
                 len++;
                 p++;
-            } else if ((c & 0xE0) == 0xC0) {
-                len++;
-                p += 2;
-            } else if ((c & 0xF0) == 0xE0) {
-                len++;
-                p += 3;
-            } else if ((c & 0xF8) == 0xF0) {
-                len++;
-                p += 4;
             } else {
-                /* Invalid byte, skip */
-                len++;
-                p++;
+                int w = wcwidth(wc);
+                if (w < 0) {
+                    /* Non-printable character (e.g. control chars) -- 0 width */
+                    w = 0;
+                }
+                len += (size_t)w;
+                p += consumed;
             }
         }
     }

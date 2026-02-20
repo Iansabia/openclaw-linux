@@ -27,6 +27,7 @@
 #include <clawd/fs_perm.h>
 #include <clawd/policy.h>
 #include <clawd/path_scan.h>
+#include <clawd/timing.h>
 
 /* ---- helpers ------------------------------------------------------------ */
 
@@ -724,6 +725,86 @@ static void test_scan_permissions(void)
     } TEST_END();
 }
 
+
+/* ---- timing-safe comparison tests --------------------------------------- */
+
+static void test_timing_safe_cmp(void)
+{
+    fprintf(stderr, "\n=== Timing-Safe Comparison ===\n");
+
+    TEST_BEGIN("equal strings return true") {
+        const char *a = "supersecrettoken";
+        const char *b = "supersecrettoken";
+        TEST_ASSERT(clawd_timing_safe_cmp(a, b, 16));
+    } TEST_END();
+
+    TEST_BEGIN("equal binary data returns true") {
+        unsigned char a[] = {0x00, 0xff, 0x42, 0xde, 0xad, 0xbe, 0xef, 0x01};
+        unsigned char b[] = {0x00, 0xff, 0x42, 0xde, 0xad, 0xbe, 0xef, 0x01};
+        TEST_ASSERT(clawd_timing_safe_cmp(a, b, sizeof(a)));
+    } TEST_END();
+
+    TEST_BEGIN("different strings return false") {
+        const char *a = "supersecrettoken";
+        const char *b = "differentsecrett";
+        TEST_ASSERT(!clawd_timing_safe_cmp(a, b, 16));
+    } TEST_END();
+
+    TEST_BEGIN("single byte difference returns false") {
+        const char *a = "abcdefgh";
+        const char *b = "abcdefgi";
+        TEST_ASSERT(!clawd_timing_safe_cmp(a, b, 8));
+    } TEST_END();
+
+    TEST_BEGIN("difference at first byte returns false") {
+        const char *a = "Xbcdefgh";
+        const char *b = "abcdefgh";
+        TEST_ASSERT(!clawd_timing_safe_cmp(a, b, 8));
+    } TEST_END();
+
+    TEST_BEGIN("zero-length comparison returns true") {
+        const char *a = "hello";
+        const char *b = "world";
+        TEST_ASSERT(clawd_timing_safe_cmp(a, b, 0));
+    } TEST_END();
+
+    TEST_BEGIN("both NULL with zero length returns true") {
+        TEST_ASSERT(clawd_timing_safe_cmp(NULL, NULL, 0));
+    } TEST_END();
+
+    TEST_BEGIN("NULL first pointer returns false") {
+        const char *b = "hello";
+        TEST_ASSERT(!clawd_timing_safe_cmp(NULL, b, 5));
+    } TEST_END();
+
+    TEST_BEGIN("NULL second pointer returns false") {
+        const char *a = "hello";
+        TEST_ASSERT(!clawd_timing_safe_cmp(a, NULL, 5));
+    } TEST_END();
+
+    TEST_BEGIN("NULL pointer with zero length returns false") {
+        const char *a = "hello";
+        TEST_ASSERT(!clawd_timing_safe_cmp(NULL, a, 0));
+        TEST_ASSERT(!clawd_timing_safe_cmp(a, NULL, 0));
+    } TEST_END();
+
+    TEST_BEGIN("both NULL with non-zero length returns false") {
+        TEST_ASSERT(!clawd_timing_safe_cmp(NULL, NULL, 10));
+    } TEST_END();
+
+    TEST_BEGIN("single byte equal") {
+        unsigned char a = 0x42;
+        unsigned char b = 0x42;
+        TEST_ASSERT(clawd_timing_safe_cmp(&a, &b, 1));
+    } TEST_END();
+
+    TEST_BEGIN("single byte different") {
+        unsigned char a = 0x42;
+        unsigned char b = 0x43;
+        TEST_ASSERT(!clawd_timing_safe_cmp(&a, &b, 1));
+    } TEST_END();
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 int main(void)
@@ -738,6 +819,7 @@ int main(void)
     test_path_scanner();
     test_audit();
     test_scan_permissions();
+    test_timing_safe_cmp();
 
     fprintf(stderr, "\n============================\n");
     fprintf(stderr, "Results: %d/%d passed", pass_count, test_count);

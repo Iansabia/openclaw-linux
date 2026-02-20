@@ -22,6 +22,8 @@
 #include <errno.h>
 #include <fcntl.h>
 
+#include "sandbox/sandbox_internal.h"
+
 /* Forward declarations for sandbox subsystems */
 extern bool clawd_ns_user_ns_available(void);
 extern int  clawd_ns_setup_user_mapping(pid_t child_pid, uid_t host_uid, gid_t host_gid);
@@ -29,7 +31,6 @@ extern int  clawd_seccomp_apply_filter(void);
 extern int  clawd_mount_setup(const char *workspace, const char **readonly_paths, int readonly_count);
 
 /* cgroup interface */
-typedef struct clawd_cgroup clawd_cgroup_t;
 extern clawd_cgroup_t *clawd_cgroup_create(unsigned int sandbox_id);
 extern int  clawd_cgroup_set_memory(clawd_cgroup_t *cg, int limit_mb);
 extern int  clawd_cgroup_set_cpu(clawd_cgroup_t *cg, int cores);
@@ -151,6 +152,7 @@ typedef struct {
     char *const *argv;
     const clawd_sandbox_opts_t *opts;
     int          pipe_fd;       /* write end of pipe for signaling parent */
+    int          outfd_write;   /* write end of output capture pipe */
 } child_args_t;
 
 static int child_fn(void *arg)
@@ -159,6 +161,11 @@ static int child_fn(void *arg)
 
     /* Wait for parent to set up UID/GID mapping */
     close(ca->pipe_fd);
+
+    /* Redirect stdout and stderr to the output capture pipe */
+    dup2(ca->outfd_write, STDOUT_FILENO);
+    dup2(ca->outfd_write, STDERR_FILENO);
+    close(ca->outfd_write);
 
     /* Set up mount namespace */
     clawd_mount_setup(ca->opts->workspace,
@@ -207,10 +214,11 @@ int clawd_sandbox_exec(clawd_sandbox_t *sb, const char *cmd,
     }
 
     child_args_t ca = {
-        .cmd     = cmd,
-        .argv    = argv,
-        .opts    = &sb->opts,
-        .pipe_fd = pipefd[0],
+        .cmd        = cmd,
+        .argv       = argv,
+        .opts       = &sb->opts,
+        .pipe_fd    = pipefd[0],
+        .outfd_write = outfd[1],
     };
 
     /* Clone with namespaces */
@@ -243,7 +251,7 @@ int clawd_sandbox_exec(clawd_sandbox_t *sb, const char *cmd,
     /* Signal child to proceed */
     close(pipefd[1]);
 
-    /* Close write end of output pipe */
+    /* Close write end of output pipe in parent */
     close(outfd[1]);
 
     /* Read child output */

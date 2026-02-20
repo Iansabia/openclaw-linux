@@ -7,6 +7,7 @@ set(SECURITY_SOURCES
     src/fs_perm.c
     src/policy.c
     src/path_scan.c
+    src/timing.c
 )
 
 set(SECURITY_HEADERS
@@ -14,6 +15,7 @@ set(SECURITY_HEADERS
     include/clawd/fs_perm.h
     include/clawd/policy.h
     include/clawd/path_scan.h
+    include/clawd/timing.h
 )
 
 # ---------- library target ------------------------------------------------
