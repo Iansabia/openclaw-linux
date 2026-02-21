@@ -50,6 +50,10 @@
 #include <systemd/sd-daemon.h>
 #endif
 
+#ifdef __linux__
+#include <clawd/kernel.h>
+#endif
+
 #include <poll.h>
 
 #include <microhttpd.h>
@@ -78,6 +82,12 @@ static volatile sig_atomic_t g_shutdown      = 0;
 static struct MHD_Daemon    *g_httpd         = NULL;
 static int                   g_unix_fd       = -1;
 static char                  g_pidfile[512]  = {0};
+
+#ifdef __linux__
+static int                   g_kernel_fd     = -1;
+static pthread_t             g_kernel_thread;
+static bool                  g_kernel_thread_running = false;
+#endif
 
 /* ---- Session tracking --------------------------------------------------- */
 
@@ -327,6 +337,12 @@ static enum MHD_Result handle_health(struct MHD_Connection *conn)
     cJSON_AddNumberToObject(obj, "uptime", 0); /* TODO: track uptime */
     cJSON_AddNumberToObject(obj, "active_sessions",
                             (double)session_count_active());
+
+#ifdef __linux__
+    cJSON_AddBoolToObject(obj, "kernel_connected", g_kernel_fd >= 0);
+#else
+    cJSON_AddBoolToObject(obj, "kernel_connected", false);
+#endif
 
     struct MHD_Response *resp = json_success_response(obj);
     cJSON_Delete(obj);
@@ -612,42 +628,17 @@ static int unix_socket_create(const char *path)
 }
 
 /**
- * Handle a single JSON-RPC request on a Unix domain socket client connection.
+ * Dispatch a JSON-RPC request and return a malloc'd JSON response string.
+ * Caller must free the returned string. Returns NULL on allocation failure.
  */
-static void unix_client_handle(int client_fd)
+static char *jsonrpc_dispatch(const char *request_data, size_t request_len)
 {
-    char buf[UNIX_BUF_SIZE];
-    clawd_str_t request = clawd_str_new();
+    (void)request_len;
 
-    /* Read until newline or EOF. */
-    for (;;) {
-        ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
-        if (n <= 0)
-            break;
-        buf[n] = '\0';
-        clawd_str_append(&request, buf, (size_t)n);
-        if (request.len > 0 && request.data[request.len - 1] == '\n')
-            break;
-        if (request.len > MAX_POST_DATA)
-            break;
-    }
-
-    if (request.len == 0) {
-        clawd_str_free(&request);
-        return;
-    }
-
-    clawd_str_trim(&request);
-
-    /* Parse JSON-RPC request. */
-    cJSON *req = clawd_json_parse(request.data);
-    clawd_str_free(&request);
-
+    cJSON *req = clawd_json_parse(request_data);
     if (!req) {
-        const char *err = "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32700,"
-                          "\"message\":\"parse error\"},\"id\":null}\n";
-        write(client_fd, err, strlen(err));
-        return;
+        return strdup("{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32700,"
+                      "\"message\":\"parse error\"},\"id\":null}");
     }
 
     const char *method = clawd_json_get_string(req, "method");
@@ -714,6 +705,36 @@ static void unix_client_handle(int client_fd)
             }
         }
         pthread_mutex_unlock(&g_sessions_lock);
+    } else if (strcmp(method, "kernel.status") == 0) {
+        cJSON *result = cJSON_AddObjectToObject(resp, "result");
+#ifdef __linux__
+        if (g_kernel_fd >= 0) {
+            struct clawd_kstats kstats;
+            if (clawd_kernel_get_stats(g_kernel_fd, &kstats) == 0) {
+                cJSON_AddBoolToObject(result, "connected", true);
+                cJSON_AddNumberToObject(result, "messages_processed",
+                                        (double)kstats.messages_processed);
+                cJSON_AddNumberToObject(result, "bytes_read",
+                                        (double)kstats.bytes_read);
+                cJSON_AddNumberToObject(result, "bytes_written",
+                                        (double)kstats.bytes_written);
+                cJSON_AddNumberToObject(result, "netfilter_packets",
+                                        (double)kstats.netfilter_packets);
+                cJSON_AddNumberToObject(result, "uptime_seconds",
+                                        (double)kstats.uptime_seconds);
+            } else {
+                cJSON_AddBoolToObject(result, "connected", false);
+                cJSON_AddStringToObject(result, "error", "ioctl failed");
+            }
+        } else {
+            cJSON_AddBoolToObject(result, "connected", false);
+            cJSON_AddStringToObject(result, "error", "not available");
+        }
+#else
+        cJSON_AddBoolToObject(result, "connected", false);
+        cJSON_AddStringToObject(result, "error",
+                                "kernel module only available on Linux");
+#endif
     } else {
         cJSON *err = cJSON_AddObjectToObject(resp, "error");
         cJSON_AddNumberToObject(err, "code", -32601);
@@ -723,6 +744,40 @@ static void unix_client_handle(int client_fd)
     char *resp_str = cJSON_PrintUnformatted(resp);
     cJSON_Delete(resp);
     cJSON_Delete(req);
+
+    return resp_str;
+}
+
+/**
+ * Handle a single JSON-RPC request on a Unix domain socket client connection.
+ */
+static void unix_client_handle(int client_fd)
+{
+    char buf[UNIX_BUF_SIZE];
+    clawd_str_t request = clawd_str_new();
+
+    /* Read until newline or EOF. */
+    for (;;) {
+        ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
+        if (n <= 0)
+            break;
+        buf[n] = '\0';
+        clawd_str_append(&request, buf, (size_t)n);
+        if (request.len > 0 && request.data[request.len - 1] == '\n')
+            break;
+        if (request.len > MAX_POST_DATA)
+            break;
+    }
+
+    if (request.len == 0) {
+        clawd_str_free(&request);
+        return;
+    }
+
+    clawd_str_trim(&request);
+
+    char *resp_str = jsonrpc_dispatch(request.data, request.len);
+    clawd_str_free(&request);
 
     if (resp_str) {
         size_t rlen = strlen(resp_str);
@@ -758,6 +813,38 @@ static void *unix_client_thread(void *arg)
     close(client_fd);
     return NULL;
 }
+
+/* ---- Kernel reader thread ----------------------------------------------- */
+
+#ifdef __linux__
+static void *kernel_reader_thread(void *arg)
+{
+    (void)arg;
+    CLAWD_INFO("kernel reader thread started");
+
+    while (!g_shutdown) {
+        size_t len = 0;
+        char *msg = clawd_kernel_recv(g_kernel_fd, &len);
+        if (!msg) {
+            /* EAGAIN or error — brief sleep and retry */
+            usleep(10000); /* 10ms */
+            continue;
+        }
+
+        /* Dispatch and send response */
+        char *response = jsonrpc_dispatch(msg, len);
+        free(msg);
+
+        if (response) {
+            clawd_kernel_send(g_kernel_fd, response, strlen(response));
+            free(response);
+        }
+    }
+
+    CLAWD_INFO("kernel reader thread exited");
+    return NULL;
+}
+#endif
 
 /* ---- PID file ----------------------------------------------------------- */
 
@@ -976,6 +1063,18 @@ static void shutdown_gateway(void)
 {
     CLAWD_INFO("shutting down gateway");
 
+#ifdef __linux__
+    /* Stop kernel reader thread. */
+    if (g_kernel_thread_running) {
+        pthread_join(g_kernel_thread, NULL);
+        g_kernel_thread_running = false;
+    }
+    if (g_kernel_fd >= 0) {
+        clawd_kernel_close(g_kernel_fd);
+        g_kernel_fd = -1;
+    }
+#endif
+
     /* Stop HTTP server. */
     if (g_httpd) {
         MHD_stop_daemon(g_httpd);
@@ -1024,6 +1123,17 @@ static void usage(void)
         "  GET  /v1/config             Current configuration\n"
         "  POST /v1/agent/chat         Agent chat (with tool use)\n"
         "  GET  /v1/sessions           List active sessions\n"
+        "\n"
+        "JSON-RPC methods (Unix socket / kernel channel):\n"
+        "  chat.send       Send a chat message\n"
+        "  health          Health check\n"
+        "  config.get      Get a configuration value\n"
+        "  sessions.list   List active sessions\n"
+        "  kernel.status   Kernel module statistics (Linux only)\n"
+        "\n"
+        "Kernel channel:\n"
+        "  On Linux, if the clawd kernel module is loaded, the gateway\n"
+        "  connects to /dev/clawd for IPC via a dedicated reader thread.\n"
         "\n"
     );
 }
@@ -1202,6 +1312,28 @@ int main(int argc, char **argv)
             /* Non-fatal: HTTP still works. */
         }
     }
+
+    /* Open kernel device if available (Linux only). */
+#ifdef __linux__
+    if (clawd_kernel_available()) {
+        g_kernel_fd = clawd_kernel_open();
+        if (g_kernel_fd >= 0) {
+            if (pthread_create(&g_kernel_thread, NULL,
+                               kernel_reader_thread, NULL) == 0) {
+                g_kernel_thread_running = true;
+                CLAWD_INFO("kernel channel connected (/dev/clawd)");
+            } else {
+                CLAWD_WARN("failed to create kernel reader thread");
+                clawd_kernel_close(g_kernel_fd);
+                g_kernel_fd = -1;
+            }
+        } else {
+            CLAWD_WARN("kernel module loaded but /dev/clawd not accessible");
+        }
+    } else {
+        CLAWD_INFO("kernel module not loaded, skipping /dev/clawd");
+    }
+#endif
 
     /* Notify systemd that we are ready. */
 #ifdef HAVE_SYSTEMD
