@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <locale.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -117,6 +118,19 @@ typedef struct {
     /* Control flags. */
     bool   running;
     bool   needs_redraw;
+
+    /* Async response handling. */
+    bool              waiting;           /* true while waiting for gateway */
+    int               think_frame;       /* animation frame counter */
+    char             *pending_response;  /* response from background thread */
+    bool              response_ready;    /* background thread finished */
+    bool              response_error;    /* response was an error */
+    pthread_mutex_t   async_lock;
+
+    /* Streaming text reveal. */
+    char             *stream_text;       /* full text to reveal gradually */
+    int               stream_pos;        /* characters revealed so far */
+    int               stream_msg_idx;    /* message index being streamed */
 } tui_state_t;
 
 static tui_state_t g_tui;
@@ -186,8 +200,38 @@ static int tui_connect_gateway(void)
 
 static char *gateway_rpc_call(const char *method, cJSON *params)
 {
-    if (!g_tui.connected || g_tui.gateway_fd < 0)
+    /* Create a fresh connection per RPC call (server closes after each). */
+    const char *sock_path = g_tui.cfg.gateway.socket_path;
+    char *default_sock = NULL;
+    if (!sock_path) {
+        default_sock = clawd_paths_socket();
+        sock_path = default_sock;
+    }
+    if (!sock_path) {
+        free(default_sock);
+        g_tui.connected = false;
         return NULL;
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        free(default_sock);
+        g_tui.connected = false;
+        return NULL;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
+    free(default_sock);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        g_tui.connected = false;
+        return NULL;
+    }
+    g_tui.connected = true;
 
     static int rpc_id = 1;
 
@@ -200,13 +244,16 @@ static char *gateway_rpc_call(const char *method, cJSON *params)
 
     char *payload = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
-    if (!payload)
+    if (!payload) {
+        close(fd);
         return NULL;
+    }
 
     size_t plen = strlen(payload);
     char *sendbuf = malloc(plen + 2);
     if (!sendbuf) {
         free(payload);
+        close(fd);
         return NULL;
     }
     memcpy(sendbuf, payload, plen);
@@ -214,13 +261,14 @@ static char *gateway_rpc_call(const char *method, cJSON *params)
     sendbuf[plen + 1] = '\0';
     free(payload);
 
-    ssize_t total = (ssize_t)(plen + 1);
+    ssize_t total_to_send = (ssize_t)(plen + 1);
     ssize_t sent = 0;
-    while (sent < total) {
-        ssize_t n = write(g_tui.gateway_fd, sendbuf + sent,
-                          (size_t)(total - sent));
+    while (sent < total_to_send) {
+        ssize_t n = write(fd, sendbuf + sent,
+                          (size_t)(total_to_send - sent));
         if (n <= 0) {
             free(sendbuf);
+            close(fd);
             g_tui.connected = false;
             return NULL;
         }
@@ -232,19 +280,20 @@ static char *gateway_rpc_call(const char *method, cJSON *params)
     clawd_str_t resp = clawd_str_new();
     char buf[4096];
     for (;;) {
-        ssize_t n = read(g_tui.gateway_fd, buf, sizeof(buf) - 1);
-        if (n <= 0) {
-            g_tui.connected = false;
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        if (n <= 0)
             break;
-        }
         buf[n] = '\0';
         clawd_str_append(&resp, buf, (size_t)n);
         if (resp.len > 0 && resp.data[resp.len - 1] == '\n')
             break;
     }
 
+    close(fd);
+
     if (resp.len == 0) {
         clawd_str_free(&resp);
+        g_tui.connected = false;
         return NULL;
     }
 
@@ -256,9 +305,59 @@ static char *gateway_rpc_call(const char *method, cJSON *params)
     return result;
 }
 
+/* ---- Async response thread ---------------------------------------------- */
+
+static void *response_thread_fn(void *arg)
+{
+    char *msg_text = (char *)arg;
+
+    cJSON *params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "message", msg_text);
+    cJSON_AddStringToObject(params, "channel_id", "tui");
+    cJSON_AddStringToObject(params, "user_id", "local");
+
+    char *resp_str = gateway_rpc_call("chat.send", params);
+    cJSON_Delete(params);
+    free(msg_text);
+
+    pthread_mutex_lock(&g_tui.async_lock);
+    if (!resp_str) {
+        g_tui.pending_response = strdup("No response from gateway.");
+        g_tui.response_error = true;
+    } else {
+        cJSON *resp = clawd_json_parse(resp_str);
+        free(resp_str);
+        if (!resp) {
+            g_tui.pending_response = strdup("Failed to parse gateway response.");
+            g_tui.response_error = true;
+        } else {
+            cJSON *error = cJSON_GetObjectItem(resp, "error");
+            if (error) {
+                const char *errmsg = clawd_json_get_string(error, "message");
+                char errbuf[512];
+                snprintf(errbuf, sizeof(errbuf), "Gateway error: %s",
+                         errmsg ? errmsg : "unknown");
+                g_tui.pending_response = strdup(errbuf);
+                g_tui.response_error = true;
+            } else {
+                cJSON *result_obj = cJSON_GetObjectItem(resp, "result");
+                const char *content = result_obj
+                    ? clawd_json_get_string(result_obj, "content") : NULL;
+                g_tui.pending_response = strdup(
+                    content ? content : "Empty response.");
+                g_tui.response_error = false;
+            }
+            cJSON_Delete(resp);
+        }
+    }
+    g_tui.response_ready = true;
+    pthread_mutex_unlock(&g_tui.async_lock);
+    return NULL;
+}
+
 static void tui_send_message(void)
 {
-    if (g_tui.input_len == 0)
+    if (g_tui.input_len == 0 || g_tui.waiting)
         return;
 
     /* NUL-terminate the input. */
@@ -286,9 +385,6 @@ static void tui_send_message(void)
         return;
     }
     if (strcmp(msg_text, "/reconnect") == 0) {
-        if (g_tui.gateway_fd >= 0)
-            close(g_tui.gateway_fd);
-        g_tui.gateway_fd = -1;
         g_tui.connected = false;
         tui_connect_gateway();
         g_tui.needs_redraw = true;
@@ -316,61 +412,20 @@ static void tui_send_message(void)
     tui_render();
     doupdate();
 
-    /* Connect if needed. */
-    if (!g_tui.connected) {
-        if (tui_connect_gateway() < 0) {
-            tui_add_message(MSG_ERROR,
-                            "Not connected to gateway. Use /reconnect to retry.");
-            g_tui.needs_redraw = true;
-            free(msg_text);
-            return;
-        }
-    }
+    /* Launch async request in background thread. */
+    g_tui.waiting = true;
+    g_tui.think_frame = 0;
+    g_tui.response_ready = false;
+    g_tui.response_error = false;
 
-    /* Send to gateway. */
-    cJSON *params = cJSON_CreateObject();
-    cJSON_AddStringToObject(params, "message", msg_text);
-    cJSON_AddBoolToObject(params, "stream", false);
-
-    char *resp_str = gateway_rpc_call("chat.send", params);
-    cJSON_Delete(params);
-    free(msg_text);
-
-    if (!resp_str) {
-        tui_add_message(MSG_ERROR, "No response from gateway.");
-        g_tui.needs_redraw = true;
-        return;
-    }
-
-    /* Parse response. */
-    cJSON *resp = clawd_json_parse(resp_str);
-    free(resp_str);
-
-    if (!resp) {
-        tui_add_message(MSG_ERROR, "Failed to parse gateway response.");
-        g_tui.needs_redraw = true;
-        return;
-    }
-
-    cJSON *error = cJSON_GetObjectItem(resp, "error");
-    if (error) {
-        const char *errmsg = clawd_json_get_string(error, "message");
-        char errbuf[512];
-        snprintf(errbuf, sizeof(errbuf), "Gateway error: %s",
-                 errmsg ? errmsg : "unknown");
-        tui_add_message(MSG_ERROR, errbuf);
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, response_thread_fn, msg_text) == 0) {
+        pthread_detach(tid);
     } else {
-        cJSON *result = cJSON_GetObjectItem(resp, "result");
-        if (result) {
-            const char *content = clawd_json_get_string(result, "content");
-            if (content)
-                tui_add_message(MSG_ASSISTANT, content);
-            else
-                tui_add_message(MSG_ERROR, "Empty response from gateway.");
-        }
+        tui_add_message(MSG_ERROR, "Failed to start response thread.");
+        g_tui.waiting = false;
+        free(msg_text);
     }
-
-    cJSON_Delete(resp);
     g_tui.needs_redraw = true;
 }
 
@@ -580,6 +635,14 @@ static void tui_init(void)
     g_tui.input_pos    = 0;
     g_tui.input_buf[0] = '\0';
     g_tui.total_tokens = 0;
+
+    /* Async state. */
+    g_tui.waiting          = false;
+    g_tui.response_ready   = false;
+    g_tui.pending_response = NULL;
+    g_tui.stream_text      = NULL;
+    g_tui.stream_pos       = 0;
+    pthread_mutex_init(&g_tui.async_lock, NULL);
     snprintf(g_tui.status_model, sizeof(g_tui.status_model), "%s",
              g_tui.cfg.model.default_model ? g_tui.cfg.model.default_model
                                            : "claude-sonnet-4-20250514");
@@ -599,6 +662,11 @@ static void tui_destroy(void)
         free(g_tui.messages[i].text);
 
     tui_display_lines_clear();
+
+    /* Clean up async state. */
+    pthread_mutex_destroy(&g_tui.async_lock);
+    free(g_tui.pending_response);
+    free(g_tui.stream_text);
 
     /* Clean up ncurses. */
     if (g_tui.win_chat)
@@ -697,8 +765,18 @@ static void tui_render_status(void)
     for (int i = 0; i < g_tui.term_cols; i++)
         mvwaddch(g_tui.win_status, 0, i, ' ');
 
-    /* Left side: connection status. */
-    if (g_tui.connected) {
+    /* Left side: connection status / thinking animation. */
+    if (g_tui.waiting) {
+        const char *dots[] = {"   ", ".  ", ".. ", "..."};
+        int dot_idx = (g_tui.think_frame / 4) % 4;
+        wattron(g_tui.win_status, A_BOLD);
+        mvwprintw(g_tui.win_status, 0, 1, " thinking%s ", dots[dot_idx]);
+        wattroff(g_tui.win_status, A_BOLD);
+    } else if (g_tui.stream_text) {
+        wattron(g_tui.win_status, A_BOLD);
+        mvwprintw(g_tui.win_status, 0, 1, " streaming... ");
+        wattroff(g_tui.win_status, A_BOLD);
+    } else if (g_tui.connected) {
         mvwprintw(g_tui.win_status, 0, 1, " [connected] ");
     } else {
         mvwprintw(g_tui.win_status, 0, 1, " [disconnected] ");
@@ -1017,6 +1095,70 @@ int main(int argc, char **argv)
 
     /* Main loop. */
     while (g_tui.running) {
+        /* Check for async response completion. */
+        if (g_tui.waiting) {
+            pthread_mutex_lock(&g_tui.async_lock);
+            if (g_tui.response_ready) {
+                g_tui.waiting = false;
+                if (g_tui.pending_response) {
+                    if (g_tui.response_error) {
+                        tui_add_message(MSG_ERROR, g_tui.pending_response);
+                        free(g_tui.pending_response);
+                    } else {
+                        /* Start streaming text reveal. */
+                        g_tui.stream_text = g_tui.pending_response;
+                        g_tui.stream_pos = 0;
+                        tui_add_message(MSG_ASSISTANT, "");
+                        g_tui.stream_msg_idx = g_tui.msg_count - 1;
+                    }
+                    g_tui.pending_response = NULL;
+                }
+                g_tui.needs_redraw = true;
+            } else {
+                g_tui.think_frame++;
+                g_tui.needs_redraw = true;
+            }
+            pthread_mutex_unlock(&g_tui.async_lock);
+        }
+
+        /* Handle streaming text reveal (char-by-char effect). */
+        if (g_tui.stream_text) {
+            int total_len = (int)strlen(g_tui.stream_text);
+            int remaining = total_len - g_tui.stream_pos;
+            if (remaining > 0) {
+                int advance = 8;
+                if (total_len > 2000) advance = 24;
+                else if (total_len > 1000) advance = 16;
+                if (advance > remaining) advance = remaining;
+                g_tui.stream_pos += advance;
+                /* Update the message text to show revealed portion. */
+                chat_message_t *msg = &g_tui.messages[g_tui.stream_msg_idx];
+                free(msg->text);
+                char *partial = malloc((size_t)g_tui.stream_pos + 1);
+                if (partial) {
+                    memcpy(partial, g_tui.stream_text,
+                           (size_t)g_tui.stream_pos);
+                    partial[g_tui.stream_pos] = '\0';
+                    msg->text = partial;
+                } else {
+                    msg->text = strdup(g_tui.stream_text);
+                    g_tui.stream_pos = total_len;
+                }
+                g_tui.needs_redraw = true;
+            } else {
+                /* Streaming complete. */
+                free(g_tui.stream_text);
+                g_tui.stream_text = NULL;
+                g_tui.needs_redraw = true;
+            }
+        }
+
+        /* Adjust refresh rate: faster during streaming/thinking. */
+        if (g_tui.stream_text || g_tui.waiting)
+            timeout(16);   /* ~60fps for smooth animation. */
+        else
+            timeout(100);  /* Normal idle rate. */
+
         if (g_tui.needs_redraw)
             tui_render();
 

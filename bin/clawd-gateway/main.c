@@ -120,6 +120,11 @@ typedef struct {
         char *content;
     } history[MAX_HISTORY_MESSAGES];
     int      history_count;
+#ifdef HAVE_AGENTS
+    clawd_provider_t *provider;
+    clawd_tool_ctx_t *tools;
+    clawd_agent_t    *agent;
+#endif
 } gateway_session_t;
 
 static gateway_session_t g_sessions[MAX_SESSIONS];
@@ -134,6 +139,11 @@ static void session_clear_history(gateway_session_t *s)
         s->history[i].content = NULL;
     }
     s->history_count = 0;
+#ifdef HAVE_AGENTS
+    if (s->agent)   { clawd_agent_free(s->agent);     s->agent = NULL; }
+    if (s->tools)   { clawd_tool_ctx_free(s->tools);   s->tools = NULL; }
+    if (s->provider) { clawd_provider_free(s->provider); s->provider = NULL; }
+#endif
 }
 
 static void session_add_message(gateway_session_t *s,
@@ -653,7 +663,9 @@ static enum MHD_Result handle_agent_chat(
             if (tools) clawd_tool_register_defaults(tools);
         }
         clawd_agent_opts_t agent_opts = {
-            .provider = provider, .tools = tools, .system_prompt = NULL,
+            .provider = provider, .tools = tools,
+            .system_prompt = g_cfg.model.system_prompt,
+            .model = g_cfg.model.default_model,
             .max_turns = 10, .sandbox_tools = g_cfg.security.sandbox_enabled,
             .on_stream = NULL, .stream_userdata = NULL
         };
@@ -961,60 +973,44 @@ static void unix_client_handle(int client_fd)
                 ? session_find_or_create(channel_id, user_id)
                 : session_create();
 
-            /* Add user message to history */
-            if (sess) session_add_message(sess, "user", message);
+            /* Lazily initialize agent with tools for this session */
+            if (sess && !sess->agent) {
+                clawd_provider_type_t ptype = resolve_provider_type(
+                    g_cfg.model.default_provider);
+                sess->provider = clawd_provider_new(ptype, g_cfg.model.api_key);
+                if (sess->provider) {
+                    sess->tools = clawd_tool_ctx_new("/tmp/clawd-workspace");
+                    if (sess->tools)
+                        clawd_tool_register_defaults(sess->tools);
 
-            clawd_provider_type_t ptype = resolve_provider_type(
-                g_cfg.model.default_provider);
-            clawd_provider_t *provider = clawd_provider_new(ptype,
-                g_cfg.model.api_key);
-            char *agent_response = NULL;
-            if (provider) {
-                /* Build message list from session history */
-                clawd_message_t *msg_list = NULL;
-                if (sess) {
-                    for (int i = 0; i < sess->history_count; i++) {
-                        clawd_role_t role = CLAWD_ROLE_USER;
-                        if (strcmp(sess->history[i].role, "assistant") == 0)
-                            role = CLAWD_ROLE_ASSISTANT;
-                        clawd_message_t *m = clawd_message_new(
-                            role, sess->history[i].content);
-                        if (m) clawd_message_append(&msg_list, m);
-                    }
-                } else {
-                    msg_list = clawd_message_new(CLAWD_ROLE_USER, message);
+                    clawd_agent_opts_t agent_opts = {
+                        .provider       = sess->provider,
+                        .tools          = sess->tools,
+                        .system_prompt  = g_cfg.model.system_prompt,
+                        .model          = g_cfg.model.default_model,
+                        .max_turns      = 10,
+                        .sandbox_tools  = g_cfg.security.sandbox_enabled,
+                        .on_stream      = NULL,
+                        .stream_userdata = NULL
+                    };
+                    sess->agent = clawd_agent_new(&agent_opts);
+                    if (sess->agent)
+                        CLAWD_INFO("chat.send: created agent for session %s",
+                                   sess->id);
                 }
-
-                const char *effective_model = g_cfg.model.default_model
-                    ? g_cfg.model.default_model : NULL;
-                clawd_completion_opts_t opts = {
-                    .model = effective_model, .messages = msg_list,
-                    .system_prompt = g_cfg.model.system_prompt,
-                    .max_tokens = g_cfg.model.max_tokens > 0
-                        ? g_cfg.model.max_tokens : 4096,
-                    .temperature = g_cfg.model.temperature,
-                    .tools_json = NULL,
-                    .stream = false, .stream_cb = NULL,
-                    .stream_userdata = NULL
-                };
-                clawd_completion_t comp;
-                memset(&comp, 0, sizeof(comp));
-                int rc = clawd_provider_complete(provider, &opts, &comp);
-                if (rc == 0 && comp.content) {
-                    agent_response = comp.content;
-                    comp.content = NULL;
-                    /* Add assistant response to history */
-                    if (sess)
-                        session_add_message(sess, "assistant", agent_response);
-                } else {
-                    CLAWD_ERROR("chat.send: provider complete failed (rc=%d)", rc);
-                }
-                clawd_completion_free(&comp);
-                clawd_message_free(msg_list);
-                clawd_provider_free(provider);
-            } else {
-                CLAWD_ERROR("chat.send: provider creation failed");
             }
+
+            /* Run the agent loop (handles history + tool use internally) */
+            char *agent_response = NULL;
+            if (sess && sess->agent) {
+                int rc = clawd_agent_chat(sess->agent, message,
+                                          &agent_response);
+                if (rc != 0)
+                    CLAWD_ERROR("chat.send: agent chat failed (rc=%d)", rc);
+            } else {
+                CLAWD_ERROR("chat.send: no agent available for session");
+            }
+
             cJSON *result = cJSON_AddObjectToObject(resp, "result");
             cJSON_AddStringToObject(result, "content",
                 agent_response ? agent_response

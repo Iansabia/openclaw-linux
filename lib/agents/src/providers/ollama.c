@@ -78,9 +78,25 @@ static char *build_request_json(const clawd_provider_t *p,
             break;
         case CLAWD_ROLE_ASSISTANT:
             cJSON_AddStringToObject(jmsg, "role", "assistant");
+            /* If this is a tool-call message, add tool_calls array */
+            if (msg->tool_name && msg->tool_args) {
+                cJSON *tool_calls = cJSON_CreateArray();
+                cJSON *tc = cJSON_CreateObject();
+                cJSON *fn = cJSON_CreateObject();
+                cJSON_AddStringToObject(fn, "name", msg->tool_name);
+                /* Parse args as JSON object, fallback to string */
+                cJSON *args_obj = cJSON_Parse(msg->tool_args);
+                if (args_obj)
+                    cJSON_AddItemToObject(fn, "arguments", args_obj);
+                else
+                    cJSON_AddStringToObject(fn, "arguments", msg->tool_args);
+                cJSON_AddItemToObject(tc, "function", fn);
+                cJSON_AddItemToArray(tool_calls, tc);
+                cJSON_AddItemToObject(jmsg, "tool_calls", tool_calls);
+            }
             break;
         case CLAWD_ROLE_TOOL:
-            cJSON_AddStringToObject(jmsg, "role", "user");
+            cJSON_AddStringToObject(jmsg, "role", "tool");
             break;
         default:
             cJSON_AddStringToObject(jmsg, "role", "user");
@@ -95,6 +111,38 @@ static char *build_request_json(const clawd_provider_t *p,
     }
 
     cJSON_AddItemToObject(root, "messages", messages);
+
+    /* Convert tools from Anthropic format to Ollama/OpenAI format */
+    if (opts->tools_json) {
+        cJSON *src_tools = cJSON_Parse(opts->tools_json);
+        if (src_tools && cJSON_IsArray(src_tools)) {
+            cJSON *ollama_tools = cJSON_CreateArray();
+            cJSON *tool_item = NULL;
+            cJSON_ArrayForEach(tool_item, src_tools) {
+                const char *name = clawd_json_get_string(tool_item, "name");
+                const char *desc = clawd_json_get_string(tool_item, "description");
+                cJSON *schema = cJSON_GetObjectItem(tool_item, "input_schema");
+
+                cJSON *ollama_tool = cJSON_CreateObject();
+                cJSON_AddStringToObject(ollama_tool, "type", "function");
+                cJSON *fn = cJSON_CreateObject();
+                if (name) cJSON_AddStringToObject(fn, "name", name);
+                if (desc) cJSON_AddStringToObject(fn, "description", desc);
+                if (schema)
+                    cJSON_AddItemToObject(fn, "parameters",
+                                          cJSON_Duplicate(schema, 1));
+                else
+                    cJSON_AddItemToObject(fn, "parameters",
+                                          cJSON_CreateObject());
+                cJSON_AddItemToObject(ollama_tool, "function", fn);
+                cJSON_AddItemToArray(ollama_tools, ollama_tool);
+            }
+            cJSON_AddItemToObject(root, "tools", ollama_tools);
+            CLAWD_DEBUG("ollama: added %d tools to request",
+                       cJSON_GetArraySize(ollama_tools));
+        }
+        if (src_tools) cJSON_Delete(src_tools);
+    }
 
     /* Options */
     if (opts->temperature >= 0.0f) {
@@ -135,17 +183,59 @@ static int parse_response(const char *body, clawd_completion_t *result)
     const char *model = clawd_json_get_string(root, "model");
     if (model) result->model = strdup(model);
 
-    /* Message content */
+    /* Message content and tool calls */
     cJSON *message = cJSON_GetObjectItem(root, "message");
     if (message) {
         const char *content = clawd_json_get_string(message, "content");
         if (content) result->content = strdup(content);
+
+        /* Check for tool calls */
+        cJSON *tool_calls = cJSON_GetObjectItem(message, "tool_calls");
+        if (tool_calls && cJSON_IsArray(tool_calls) &&
+            cJSON_GetArraySize(tool_calls) > 0) {
+            result->stop_reason = strdup("tool_use");
+
+            cJSON *tc_item = NULL;
+            int tc_idx = 0;
+            cJSON_ArrayForEach(tc_item, tool_calls) {
+                cJSON *fn = cJSON_GetObjectItem(tc_item, "function");
+                if (!fn) continue;
+
+                const char *tc_name = clawd_json_get_string(fn, "name");
+                if (!tc_name) continue;
+
+                /* Build tool_call_id */
+                char tc_id[64];
+                snprintf(tc_id, sizeof(tc_id), "tc_%d", tc_idx++);
+
+                /* Get arguments as string */
+                cJSON *args_obj = cJSON_GetObjectItem(fn, "arguments");
+                char *args_str = NULL;
+                if (args_obj) {
+                    args_str = cJSON_PrintUnformatted(args_obj);
+                }
+
+                clawd_message_t *tc_msg = clawd_message_new(
+                    CLAWD_ROLE_ASSISTANT, content ? content : "");
+                if (tc_msg) {
+                    tc_msg->tool_call_id = strdup(tc_id);
+                    tc_msg->tool_name    = strdup(tc_name);
+                    tc_msg->tool_args    = args_str ? args_str : strdup("{}");
+                    clawd_message_append(&result->tool_calls, tc_msg);
+                } else {
+                    free(args_str);
+                }
+            }
+            CLAWD_INFO("ollama: parsed %d tool calls", tc_idx);
+        }
     }
 
-    /* Ollama reports done_reason */
-    bool done = clawd_json_get_bool(root, "done", false);
-    if (done) {
-        result->stop_reason = strdup("end_turn");
+    /* Ollama reports done_reason (only set if no tool calls) */
+    if (!result->stop_reason) {
+        bool done = clawd_json_get_bool(root, "done", false);
+        if (done) {
+            result->stop_reason = strdup("end_turn");
+        }
     }
 
     /* Token counts */
