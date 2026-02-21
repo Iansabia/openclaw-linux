@@ -571,7 +571,7 @@ static char *gateway_chat(const char *message,
     if (fd < 0)
         return NULL;
 
-    static int rpc_id = 1;
+    static volatile int rpc_id = 1;
 
     cJSON *params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "message", message);
@@ -619,7 +619,10 @@ static char *gateway_chat(const char *message,
     }
     free(sendbuf);
 
-    /* Read response */
+    /* Read response (with 120s timeout for tool-use round trips) */
+    struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     clawd_str_t resp = clawd_str_new();
     char buf[RPC_BUF_SIZE];
     for (;;) {
@@ -756,6 +759,63 @@ static int discord_send_typing(const char *channel_id)
     return ret;
 }
 
+/* ---- Async message handling --------------------------------------------- */
+
+typedef struct {
+    char *message;
+    char *channel_id;
+    char *author_id;
+    char *username;
+} async_msg_ctx_t;
+
+/**
+ * Background thread: send typing, call gateway, post response to Discord.
+ * Runs detached so the WebSocket loop stays unblocked.
+ */
+static void *async_message_handler(void *arg)
+{
+    async_msg_ctx_t *ctx = arg;
+
+    CLAWD_DEBUG("async handler: processing message from %s", ctx->username);
+
+    /* Send typing indicator */
+    discord_send_typing(ctx->channel_id);
+
+    /* Call gateway (this is the slow part - may take 10-120s with tool use) */
+    char *response = gateway_chat(ctx->message, ctx->channel_id, ctx->author_id);
+
+    if (response && *response) {
+        /* Discord messages have a 2000 char limit; split if needed */
+        size_t resp_len = strlen(response);
+        size_t offset = 0;
+
+        while (offset < resp_len) {
+            size_t chunk_len = resp_len - offset;
+            if (chunk_len > 1990)
+                chunk_len = 1990;
+
+            char saved = response[offset + chunk_len];
+            response[offset + chunk_len] = '\0';
+            discord_send_message(ctx->channel_id, response + offset);
+            response[offset + chunk_len] = saved;
+
+            offset += chunk_len;
+        }
+    } else {
+        discord_send_message(ctx->channel_id,
+            "I'm having trouble connecting to the gateway. "
+            "Please try again later.");
+    }
+
+    free(response);
+    free(ctx->message);
+    free(ctx->channel_id);
+    free(ctx->author_id);
+    free(ctx->username);
+    free(ctx);
+    return NULL;
+}
+
 /* ---- Discord message handling ------------------------------------------- */
 
 /**
@@ -836,36 +896,31 @@ static void handle_message_create(cJSON *data)
                username ? username : "unknown",
                channel_id, msg, strlen(msg) > 80 ? "..." : "");
 
-    /* Show typing indicator while we process */
-    discord_send_typing(channel_id);
-
-    /* Forward to clawd-gateway */
-    char *response = gateway_chat(msg, channel_id, author_id);
-
-    if (response && *response) {
-        /* Discord messages have a 2000 char limit; split if needed */
-        size_t resp_len = strlen(response);
-        size_t offset = 0;
-
-        while (offset < resp_len) {
-            size_t chunk_len = resp_len - offset;
-            if (chunk_len > 1990)
-                chunk_len = 1990;
-
-            char saved = response[offset + chunk_len];
-            response[offset + chunk_len] = '\0';
-            discord_send_message(channel_id, response + offset);
-            response[offset + chunk_len] = saved;
-
-            offset += chunk_len;
-        }
-    } else {
-        discord_send_message(channel_id,
-            "I'm having trouble connecting to the gateway. "
-            "Please try again later.");
+    /* Dispatch to background thread so WebSocket loop stays unblocked */
+    async_msg_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        CLAWD_ERROR("failed to allocate async context");
+        return;
     }
+    ctx->message    = strdup(msg);
+    ctx->channel_id = strdup(channel_id);
+    ctx->author_id  = author_id ? strdup(author_id) : strdup("");
+    ctx->username   = strdup(username ? username : "unknown");
 
-    free(response);
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    if (pthread_create(&tid, &attr, async_message_handler, ctx) != 0) {
+        CLAWD_ERROR("failed to create async message handler thread");
+        free(ctx->message);
+        free(ctx->channel_id);
+        free(ctx->author_id);
+        free(ctx->username);
+        free(ctx);
+    }
+    pthread_attr_destroy(&attr);
 }
 
 /* ---- Gateway event dispatch --------------------------------------------- */
@@ -1091,6 +1146,10 @@ int main(int argc, char *argv[])
         default:  print_usage(); return 1;
         }
     }
+
+    /* Disable output buffering so logs appear immediately in files */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
 
     /* Logging */
     int log_level = CLAWD_LOG_INFO;
