@@ -18,6 +18,7 @@ Depends: ${misc:Depends},
  clawd-agents (>= 0.1.0),
  clawd-daemon (>= 0.1.0),
  clawd-gateway (>= 0.1.0)
+Recommends: clawd-kernel (>= 0.1.0)
 Description: Clawd Linux - AI-powered Linux distribution metapackage
  Metapackage that installs all Clawd Linux components including
  the core libraries, AI gateway, terminal interface, agent framework,

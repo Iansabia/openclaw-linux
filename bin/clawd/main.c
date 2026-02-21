@@ -9,6 +9,7 @@
  *   gateway   - Gateway server management (run, status, stop)
  *   config    - Configuration management (show, set, get, edit)
  *   daemon    - Daemon management (install, start, stop, status)
+ *   kernel    - Kernel module management (status, stats, load, unload)
  *   version   - Show version information
  *   help      - Show help
  *
@@ -28,6 +29,7 @@
 #include <clawd/config.h>
 #include <clawd/paths.h>
 #include <clawd/ansi.h>
+#include <clawd/kernel.h>
 
 #include <errno.h>
 #include <getopt.h>
@@ -79,6 +81,7 @@ static int  cmd_ask(int argc, char **argv);
 static int  cmd_gateway(int argc, char **argv);
 static int  cmd_config(int argc, char **argv);
 static int  cmd_daemon(int argc, char **argv);
+static int  cmd_kernel(int argc, char **argv);
 static int  cmd_version(int argc, char **argv);
 static int  cmd_help(int argc, char **argv);
 
@@ -1372,6 +1375,123 @@ static int cmd_daemon(int argc, char **argv)
 #endif
 }
 
+/* ---- Subcommand: kernel ------------------------------------------------- */
+
+static int cmd_kernel(int argc, char **argv)
+{
+    if (argc < 1) {
+        fprintf(stderr,
+                "Usage: clawd kernel <status|stats|load|unload>\n");
+        return 1;
+    }
+
+    const char *subcmd = argv[0];
+
+    if (strcmp(subcmd, "status") == 0) {
+        if (!clawd_kernel_available()) {
+            printf("Kernel module: not loaded\n");
+            printf("  /dev/clawd is not available.\n");
+            printf("  Load with: sudo insmod clawd.ko\n");
+            return 1;
+        }
+
+        int fd = clawd_kernel_open();
+        if (fd < 0) {
+            fprintf(stderr, "clawd: cannot open /dev/clawd: %s\n",
+                    strerror(errno));
+            return 1;
+        }
+
+        struct clawd_kversion ver;
+        if (clawd_kernel_get_version(fd, &ver) == 0) {
+            printf("Kernel module: loaded\n");
+            printf("  Version: %u.%u.%u\n", ver.major, ver.minor, ver.patch);
+            printf("  Build:   %s\n", ver.build);
+        }
+
+        struct clawd_kstatus st;
+        if (clawd_kernel_get_status(fd, &st) == 0) {
+            printf("  Netfilter: %s\n", st.netfilter_enabled ? "enabled" : "disabled");
+            printf("  Log level: %d\n", st.log_level);
+            printf("  Open handles: %d\n", st.chardev_open_count);
+        }
+
+        clawd_kernel_close(fd);
+        return 0;
+    }
+
+    if (strcmp(subcmd, "stats") == 0) {
+        if (!clawd_kernel_available()) {
+            fprintf(stderr, "clawd: kernel module not loaded\n");
+            return 1;
+        }
+
+        int fd = clawd_kernel_open();
+        if (fd < 0) {
+            fprintf(stderr, "clawd: cannot open /dev/clawd: %s\n",
+                    strerror(errno));
+            return 1;
+        }
+
+        struct clawd_kstats stats;
+        if (clawd_kernel_get_stats(fd, &stats) == 0) {
+            uint64_t h = stats.uptime_seconds / 3600;
+            uint64_t m = (stats.uptime_seconds % 3600) / 60;
+            uint64_t s = stats.uptime_seconds % 60;
+
+            printf("Clawd Kernel Stats\n");
+            printf("==================\n");
+            printf("Uptime:              %lluh%llum%llus\n",
+                   (unsigned long long)h, (unsigned long long)m,
+                   (unsigned long long)s);
+            printf("Messages processed:  %llu\n",
+                   (unsigned long long)stats.messages_processed);
+            printf("Bytes read:          %llu\n",
+                   (unsigned long long)stats.bytes_read);
+            printf("Bytes written:       %llu\n",
+                   (unsigned long long)stats.bytes_written);
+            printf("Active sessions:     %llu\n",
+                   (unsigned long long)stats.active_sessions);
+            printf("Netfilter packets:   %llu\n",
+                   (unsigned long long)stats.netfilter_packets);
+            printf("Netfilter blocked:   %llu\n",
+                   (unsigned long long)stats.netfilter_blocked);
+        } else {
+            fprintf(stderr, "clawd: failed to get stats: %s\n",
+                    strerror(errno));
+            clawd_kernel_close(fd);
+            return 1;
+        }
+
+        clawd_kernel_close(fd);
+        return 0;
+    }
+
+    if (strcmp(subcmd, "load") == 0) {
+        if (clawd_kernel_available()) {
+            printf("Kernel module is already loaded.\n");
+            return 0;
+        }
+        printf("Loading clawd kernel module...\n");
+        int rc = system("sudo modprobe clawd 2>/dev/null || sudo insmod clawd.ko");
+        return rc == 0 ? 0 : 1;
+    }
+
+    if (strcmp(subcmd, "unload") == 0) {
+        if (!clawd_kernel_available()) {
+            printf("Kernel module is not loaded.\n");
+            return 0;
+        }
+        printf("Unloading clawd kernel module...\n");
+        int rc = system("sudo rmmod clawd");
+        return rc == 0 ? 0 : 1;
+    }
+
+    fprintf(stderr, "clawd: unknown kernel command '%s'\n", subcmd);
+    fprintf(stderr, "Usage: clawd kernel <status|stats|load|unload>\n");
+    return 1;
+}
+
 /* ---- Subcommand: version ------------------------------------------------ */
 
 static int cmd_version(int argc, char **argv)
@@ -1424,6 +1544,7 @@ static int cmd_help(int argc, char **argv)
         "  gateway <run|status|stop>  Gateway server management\n"
         "  config <show|set|get|edit> Configuration management\n"
         "  daemon <cmd>               Daemon management (install, start, stop, etc.)\n"
+        "  kernel <cmd>               Kernel module management (status, stats, load, unload)\n"
         "  version                    Show version information\n"
         "  help                       Show this help\n"
         "\n"
@@ -1569,6 +1690,8 @@ int main(int argc, char **argv)
         ret = cmd_config(sub_argc, sub_argv);
     } else if (strcmp(command, "daemon") == 0) {
         ret = cmd_daemon(sub_argc, sub_argv);
+    } else if (strcmp(command, "kernel") == 0) {
+        ret = cmd_kernel(sub_argc, sub_argv);
     } else if (strcmp(command, "version") == 0) {
         ret = cmd_version(sub_argc, sub_argv);
     } else if (strcmp(command, "help") == 0) {

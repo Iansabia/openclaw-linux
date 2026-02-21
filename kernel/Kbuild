@@ -1,0 +1,3 @@
+# Kbuild file for clawd kernel module
+obj-m += clawd.o
+clawd-objs := clawd_mod.o clawd_chardev.o clawd_netfilter.o clawd_procfs.o

@@ -1,0 +1,17 @@
+Source: clawd-kernel
+Section: kernel
+Priority: optional
+Maintainer: Clawd Linux Team <team@clawd.linux>
+Build-Depends: debhelper-compat (= 13), dkms, linux-headers-generic
+Standards-Version: 4.6.2
+
+Package: clawd-kernel
+Architecture: all
+Depends: ${misc:Depends},
+ dkms,
+ linux-headers-generic | linux-headers
+Description: Clawd Kernel — AI-aware Linux kernel module (DKMS)
+ Out-of-tree Linux kernel module that provides /dev/clawd for userspace
+ IPC, /proc/clawd for runtime statistics, and netfilter hooks for
+ network-aware AI analysis. Installs via DKMS for automatic rebuilds
+ on kernel updates.

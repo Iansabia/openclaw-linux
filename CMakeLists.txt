@@ -83,6 +83,7 @@ add_subdirectory(lib/process)
 add_subdirectory(lib/memory)
 add_subdirectory(lib/terminal)
 add_subdirectory(lib/agents)
+add_subdirectory(lib/kernel)
 
 # -----------------------------------------------------------------------------
 # Executables  (bin/)

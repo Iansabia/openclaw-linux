@@ -51,6 +51,7 @@ target_link_libraries(clawd PRIVATE
     clawd-core
     clawd-config
     clawd-terminal
+    clawd-kernel
 )
 
 # readline
