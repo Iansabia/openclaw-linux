@@ -1,0 +1,8 @@
+config BR2_PACKAGE_KELP_KMOD
+	bool "kelp-kmod"
+	depends on BR2_LINUX_KERNEL
+	help
+	  Kelp OS kernel module (kelp.ko).
+	  Provides /dev/kelp chardev, /proc/kelp stats,
+	  AI inference scheduler, semantic FS events,
+	  and accelerator management stubs.

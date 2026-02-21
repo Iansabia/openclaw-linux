@@ -1,7 +1,7 @@
-Origin: Clawd Linux
-Label: Clawd Linux
+Origin: Kelp Linux
+Label: Kelp Linux
 Codename: bookworm
 Architectures: amd64 arm64
 Components: main
-Description: Clawd Linux AI Assistant packages
+Description: Kelp Linux AI Assistant packages
 SignWith: default

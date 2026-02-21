@@ -1,19 +1,19 @@
 #!/bin/bash
-# Post-install hook for Clawd Linux ISO build
+# Post-install hook for Kelp Linux ISO build
 
-# Create clawd system user
-useradd --system --create-home --shell /bin/bash clawd
+# Create kelp system user
+useradd --system --create-home --shell /bin/bash kelp
 
 # Create required directories
-mkdir -p /var/log/clawd
-mkdir -p /run/clawd
-mkdir -p /etc/clawd
-chown clawd:clawd /var/log/clawd /run/clawd /etc/clawd
+mkdir -p /var/log/kelp
+mkdir -p /run/kelp
+mkdir -p /etc/kelp
+chown kelp:kelp /var/log/kelp /run/kelp /etc/kelp
 
 # Enable the gateway service
-systemctl enable clawd-gateway.service
+systemctl enable kelp-gateway.service
 
-# Set up loginctl linger for clawd user
-loginctl enable-linger clawd 2>/dev/null || true
+# Set up loginctl linger for kelp user
+loginctl enable-linger kelp 2>/dev/null || true
 
-echo "Clawd Linux setup complete"
+echo "Kelp Linux setup complete"

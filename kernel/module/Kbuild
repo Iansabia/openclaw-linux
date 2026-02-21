@@ -1,0 +1,5 @@
+# Kbuild file for kelp kernel module
+obj-m += kelp.o
+kelp-objs := kelp_mod.o kelp_chardev.o kelp_netfilter.o kelp_procfs.o kelp_ai_sched.o kelp_semfs.o kelp_accel.o
+
+ccflags-y += -I$(src)/../include

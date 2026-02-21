@@ -1,13 +1,13 @@
-Source: clawd-agents
+Source: kelp-agents
 Section: utils
 Priority: optional
-Maintainer: Clawd Linux Team <team@clawd.linux>
-Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libseccomp-dev, libcap-dev, libclawd-core-dev, libclawd-net-dev, libclawd-process-dev, libclawd-security-dev
+Maintainer: Kelp Linux Team <team@kelp.linux>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libseccomp-dev, libcap-dev, libkelp-core-dev, libkelp-net-dev, libkelp-process-dev, libkelp-security-dev
 Standards-Version: 4.6.2
 
-Package: clawd-agents
+Package: kelp-agents
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libclawd-core (>= ${source:Version}), libclawd-net (>= ${source:Version}), libclawd-process (>= ${source:Version}), libclawd-security (>= ${source:Version})
-Description: Clawd Linux AI agent framework
+Depends: ${shlibs:Depends}, ${misc:Depends}, libkelp-core (>= ${source:Version}), libkelp-net (>= ${source:Version}), libkelp-process (>= ${source:Version}), libkelp-security (>= ${source:Version})
+Description: Kelp Linux AI agent framework
  Provider integrations, tool execution, sandboxed code runners,
- and agent orchestration for the Clawd Linux system.
+ and agent orchestration for the Kelp Linux system.

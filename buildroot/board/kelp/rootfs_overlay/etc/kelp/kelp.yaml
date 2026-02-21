@@ -1,0 +1,27 @@
+# Kelp OS default configuration
+# /etc/kelp/kelp.yaml
+
+gateway:
+  listen: "0.0.0.0"
+  port: 3000
+  workers: 4
+
+kernel:
+  device: "/dev/kelp"
+  log_level: 1
+  netfilter: true
+
+ai:
+  scheduler:
+    max_queue: 1024
+  semfs:
+    enabled: true
+    watch_paths:
+      - /home
+      - /var/data
+  accelerators:
+    auto_detect: true
+
+logging:
+  level: "info"
+  file: "/var/log/kelp/kelp.log"

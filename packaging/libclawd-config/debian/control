@@ -1,20 +1,20 @@
-Source: libclawd-config
+Source: libkelp-config
 Section: libs
 Priority: optional
-Maintainer: Clawd Linux Team <team@clawd.linux>
-Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libyaml-dev, libclawd-core-dev
+Maintainer: Kelp Linux Team <team@kelp.linux>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libyaml-dev, libkelp-core-dev
 Standards-Version: 4.6.2
 
-Package: libclawd-config
+Package: libkelp-config
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libclawd-core (>= ${source:Version}), libyaml-0-2
-Description: Clawd Linux configuration library
+Depends: ${shlibs:Depends}, ${misc:Depends}, libkelp-core (>= ${source:Version}), libyaml-0-2
+Description: Kelp Linux configuration library
  YAML configuration parsing, validation, and management
- for the Clawd Linux system.
+ for the Kelp Linux system.
 
-Package: libclawd-config-dev
+Package: libkelp-config-dev
 Section: libdevel
 Architecture: any
-Depends: libclawd-config (= ${binary:Version}), ${misc:Depends}, libyaml-dev, libclawd-core-dev
-Description: Clawd Linux configuration library - development files
- Development headers and static library for libclawd-config.
+Depends: libkelp-config (= ${binary:Version}), ${misc:Depends}, libyaml-dev, libkelp-core-dev
+Description: Kelp Linux configuration library - development files
+ Development headers and static library for libkelp-config.

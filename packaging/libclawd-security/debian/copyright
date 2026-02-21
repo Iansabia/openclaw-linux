@@ -1,9 +1,9 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: clawd-linux
-Source: https://github.com/clawd-linux/clawd-linux
+Upstream-Name: kelp-linux
+Source: https://github.com/kelp-linux/kelp-linux
 
 Files: *
-Copyright: 2026 Clawd Linux Team
+Copyright: 2026 Kelp Linux Team
 License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a copy
  of this software and associated documentation files (the "Software"), to deal

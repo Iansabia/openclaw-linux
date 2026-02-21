@@ -3,4 +3,4 @@
 	dh $@
 
 override_dh_auto_configure:
-	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release -DCLAWD_BUILD_TESTS=OFF
+	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release -DKELP_BUILD_TESTS=OFF

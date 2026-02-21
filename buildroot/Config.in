@@ -1,0 +1,3 @@
+source "$BR2_EXTERNAL_KELP_PATH/package/kelp-system/Config.in"
+source "$BR2_EXTERNAL_KELP_PATH/package/kelp-kmod/Config.in"
+source "$BR2_EXTERNAL_KELP_PATH/package/kelp-config/Config.in"

@@ -1,0 +1,5 @@
+config BR2_PACKAGE_KELP_CONFIG
+	bool "kelp-config"
+	help
+	  Default configuration files for Kelp OS.
+	  Installs /etc/kelp/kelp.yaml.

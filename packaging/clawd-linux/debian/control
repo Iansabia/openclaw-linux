@@ -1,26 +1,26 @@
-Source: clawd-linux
+Source: kelp-linux
 Section: metapackages
 Priority: optional
-Maintainer: Clawd Linux Team <team@clawd.linux>
+Maintainer: Kelp Linux Team <team@kelp.linux>
 Build-Depends: debhelper-compat (= 13)
 Standards-Version: 4.6.2
 
-Package: clawd-linux
+Package: kelp-linux
 Architecture: all
 Depends: ${misc:Depends},
- libclawd-core (>= 0.1.0),
- libclawd-config (>= 0.1.0),
- libclawd-net (>= 0.1.0),
- libclawd-security (>= 0.1.0),
- libclawd-process (>= 0.1.0),
- libclawd-memory (>= 0.1.0),
- clawd-terminal (>= 0.1.0),
- clawd-agents (>= 0.1.0),
- clawd-daemon (>= 0.1.0),
- clawd-gateway (>= 0.1.0)
-Recommends: clawd-kernel (>= 0.1.0)
-Description: Clawd Linux - AI-powered Linux distribution metapackage
- Metapackage that installs all Clawd Linux components including
+ libkelp-core (>= 0.1.0),
+ libkelp-config (>= 0.1.0),
+ libkelp-net (>= 0.1.0),
+ libkelp-security (>= 0.1.0),
+ libkelp-process (>= 0.1.0),
+ libkelp-memory (>= 0.1.0),
+ kelp-terminal (>= 0.1.0),
+ kelp-agents (>= 0.1.0),
+ kelp-daemon (>= 0.1.0),
+ kelp-gateway (>= 0.1.0)
+Recommends: kelp-kernel (>= 0.1.0)
+Description: Kelp Linux - AI-powered Linux distribution metapackage
+ Metapackage that installs all Kelp Linux components including
  the core libraries, AI gateway, terminal interface, agent framework,
  and system daemon. This provides a complete AI-integrated Linux
  environment powered by Claude.

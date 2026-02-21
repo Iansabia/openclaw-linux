@@ -1,0 +1,106 @@
+/*
+ * kelp-linux :: libkelp-agents
+ * agent.h - Agent session loop (provider + tools + conversation management)
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#ifndef KELP_AGENT_H
+#define KELP_AGENT_H
+
+#include <kelp/provider.h>
+#include <kelp/tool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ---- Opaque handle ------------------------------------------------------ */
+
+typedef struct kelp_agent kelp_agent_t;
+
+/* ---- Agent options ------------------------------------------------------ */
+
+typedef struct kelp_agent_opts {
+    kelp_provider_t *provider;
+    kelp_tool_ctx_t *tools;
+    const char       *system_prompt;
+    int               max_turns;         /* max tool-use iterations (default 10) */
+    bool              sandbox_tools;     /* run tools in sandbox */
+    kelp_stream_cb   on_stream;         /* streaming output callback */
+    void             *stream_userdata;
+    const char       *model;            /* NULL = provider default */
+    int               max_tokens;       /* 0 = provider default */
+} kelp_agent_opts_t;
+
+/* ---- API ---------------------------------------------------------------- */
+
+/**
+ * Create a new agent session.
+ *
+ * @param opts  Agent options.  The provider and tools handles are borrowed
+ *              (not owned) -- the caller must keep them alive for the
+ *              lifetime of the agent.
+ * @return Agent handle, or NULL on allocation failure.
+ */
+kelp_agent_t *kelp_agent_new(const kelp_agent_opts_t *opts);
+
+/**
+ * Free an agent and all owned conversation history.
+ *
+ * @param a  Agent handle (may be NULL).
+ */
+void kelp_agent_free(kelp_agent_t *a);
+
+/**
+ * Send a user message and get an assistant response.
+ *
+ * This runs the full agent loop:
+ *   1. Append the user message to history.
+ *   2. Call the provider with the conversation + tools.
+ *   3. If the provider requests tool use, execute the tools, add results
+ *      to history, and loop back to step 2.
+ *   4. If the provider returns an end_turn, set *response to the assistant's
+ *      text and return.
+ *   5. The loop is bounded by max_turns to prevent infinite tool use.
+ *
+ * @param a         Agent handle.
+ * @param user_message  The user's input text.
+ * @param response  Output: a malloc'd string containing the final assistant
+ *                  response.  The caller must free it.
+ * @return 0 on success, -1 on error.
+ */
+int kelp_agent_chat(kelp_agent_t *a, const char *user_message, char **response);
+
+/**
+ * Reset the agent's conversation history.
+ *
+ * @param a  Agent handle.
+ */
+void kelp_agent_reset(kelp_agent_t *a);
+
+/**
+ * Get a read-only pointer to the current conversation history.
+ *
+ * The returned list must NOT be freed by the caller.
+ *
+ * @param a  Agent handle.
+ * @return Head of the message linked list (may be NULL if empty).
+ */
+kelp_message_t *kelp_agent_get_history(kelp_agent_t *a);
+
+/**
+ * Replace the agent's conversation history with a deep copy of the
+ * provided message list. The caller retains ownership of the original.
+ *
+ * @param a     Agent handle.
+ * @param msgs  Message list to copy (NULL to clear).
+ * @return 0 on success, -1 on allocation failure (history unchanged).
+ */
+int kelp_agent_set_history(kelp_agent_t *a, const kelp_message_t *msgs);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* KELP_AGENT_H */

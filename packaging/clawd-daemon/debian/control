@@ -1,13 +1,13 @@
-Source: clawd-daemon
+Source: kelp-daemon
 Section: admin
 Priority: optional
-Maintainer: Clawd Linux Team <team@clawd.linux>
-Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libsystemd-dev, libclawd-core-dev, libclawd-config-dev
+Maintainer: Kelp Linux Team <team@kelp.linux>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libsystemd-dev, libkelp-core-dev, libkelp-config-dev
 Standards-Version: 4.6.2
 
-Package: clawd-daemon
+Package: kelp-daemon
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libclawd-core (>= ${source:Version}), libclawd-config (>= ${source:Version}), systemd
-Description: Clawd Linux system daemon
- Background service for managing Clawd AI agent lifecycle,
+Depends: ${shlibs:Depends}, ${misc:Depends}, libkelp-core (>= ${source:Version}), libkelp-config (>= ${source:Version}), systemd
+Description: Kelp Linux system daemon
+ Background service for managing Kelp AI agent lifecycle,
  health monitoring, and systemd integration.

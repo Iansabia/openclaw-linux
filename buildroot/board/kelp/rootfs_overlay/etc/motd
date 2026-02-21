@@ -1,0 +1,14 @@
+
+  _  __     _          ___  ____
+ | |/ /    | |        / _ \/ ___|
+ | ' / ___ | |_ __   | | | \___ \
+ | . \/ _ \| | '_ \  | |_| |___) |
+ |_|\_\___/|_| .__/   \___/|____/
+              |_|
+
+  Kelp OS v0.1.0 — AI-First Operating System
+
+  Gateway API:  http://localhost:3000
+  Module stats: cat /proc/kelp/stats
+  AI status:    cat /proc/kelp/scheduler
+

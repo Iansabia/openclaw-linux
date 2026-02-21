@@ -1,20 +1,20 @@
-Source: libclawd-security
+Source: libkelp-security
 Section: libs
 Priority: optional
-Maintainer: Clawd Linux Team <team@clawd.linux>
-Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libclawd-core-dev
+Maintainer: Kelp Linux Team <team@kelp.linux>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libkelp-core-dev
 Standards-Version: 4.6.2
 
-Package: libclawd-security
+Package: libkelp-security
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libclawd-core (>= ${source:Version})
-Description: Clawd Linux security library
+Depends: ${shlibs:Depends}, ${misc:Depends}, libkelp-core (>= ${source:Version})
+Description: Kelp Linux security library
  Namespace sandboxing, capability dropping, seccomp filters,
- and security policy enforcement for the Clawd Linux system.
+ and security policy enforcement for the Kelp Linux system.
 
-Package: libclawd-security-dev
+Package: libkelp-security-dev
 Section: libdevel
 Architecture: any
-Depends: libclawd-security (= ${binary:Version}), ${misc:Depends}, libclawd-core-dev
-Description: Clawd Linux security library - development files
- Development headers and static library for libclawd-security.
+Depends: libkelp-security (= ${binary:Version}), ${misc:Depends}, libkelp-core-dev
+Description: Kelp Linux security library - development files
+ Development headers and static library for libkelp-security.

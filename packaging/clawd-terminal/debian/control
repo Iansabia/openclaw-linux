@@ -1,13 +1,13 @@
-Source: clawd-terminal
+Source: kelp-terminal
 Section: utils
 Priority: optional
-Maintainer: Clawd Linux Team <team@clawd.linux>
-Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libncursesw5-dev, libclawd-core-dev
+Maintainer: Kelp Linux Team <team@kelp.linux>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.20), libncursesw5-dev, libkelp-core-dev
 Standards-Version: 4.6.2
 
-Package: clawd-terminal
+Package: kelp-terminal
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libclawd-core (>= ${source:Version}), libncursesw6
-Description: Clawd Linux terminal interface
+Depends: ${shlibs:Depends}, ${misc:Depends}, libkelp-core (>= ${source:Version}), libncursesw6
+Description: Kelp Linux terminal interface
  TUI application providing interactive terminal access to the
- Clawd AI assistant with ncurses-based interface.
+ Kelp AI assistant with ncurses-based interface.

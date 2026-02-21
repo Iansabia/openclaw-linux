@@ -1,23 +1,23 @@
 [Unit]
-Description=Clawd AI Gateway
-Documentation=https://github.com/clawd-linux/clawd-linux
+Description=Kelp AI Gateway
+Documentation=https://github.com/kelp-linux/kelp-linux
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/clawd-gateway
+ExecStart=/usr/bin/kelp-gateway
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 WatchdogSec=30
 
-User=clawd
-Group=clawd
-RuntimeDirectory=clawd
-StateDirectory=clawd
-LogsDirectory=clawd
-ConfigurationDirectory=clawd
+User=kelp
+Group=kelp
+RuntimeDirectory=kelp
+StateDirectory=kelp
+LogsDirectory=kelp
+ConfigurationDirectory=kelp
 
 # Hardening
 ProtectSystem=strict

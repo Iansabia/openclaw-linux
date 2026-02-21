@@ -1,0 +1,13 @@
+config BR2_PACKAGE_KELP_SYSTEM
+	bool "kelp-system"
+	depends on BR2_PACKAGE_OPENSSL
+	depends on BR2_PACKAGE_LIBCURL
+	depends on BR2_PACKAGE_CJSON
+	depends on BR2_PACKAGE_LIBYAML
+	depends on BR2_PACKAGE_SQLITE
+	depends on BR2_PACKAGE_LIBMICROHTTPD
+	help
+	  Kelp OS userspace system: libraries, CLI, gateway, TUI, daemon.
+	  This is the core AI agent framework that runs on Kelp OS.
+
+	  https://github.com/kelp-os/kelp

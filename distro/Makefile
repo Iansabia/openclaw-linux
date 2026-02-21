@@ -9,8 +9,8 @@ iso:
 		--archive-areas "main contrib non-free non-free-firmware" \
 		--architectures amd64 \
 		--binary-images iso-hybrid \
-		--iso-application "Clawd Linux" \
-		--iso-volume "CLAWD_LINUX" \
+		--iso-application "Kelp Linux" \
+		--iso-volume "KELP_LINUX" \
 		--bootappend-live "boot=live quiet splash" \
 		--memtest none && \
 	sudo lb build
