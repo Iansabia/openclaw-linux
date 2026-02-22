@@ -1,0 +1,34 @@
+#!/bin/sh
+#
+# S01splash — Kelp OS boot splash (runs before all other services)
+#
+# Displays a clean logo on the console during boot.
+# Cleared when kelp-tui takes over.
+#
+
+case "$1" in
+    start)
+        # Clear screen and show logo
+        printf '\033[2J\033[H'
+        printf '\033[32m'
+        cat << 'LOGO'
+
+        ██╗  ██╗███████╗██╗     ██████╗      ██████╗ ███████╗
+        ██║ ██╔╝██╔════╝██║     ██╔══██╗    ██╔═══██╗██╔════╝
+        █████╔╝ █████╗  ██║     ██████╔╝    ██║   ██║███████╗
+        ██╔═██╗ ██╔══╝  ██║     ██╔═══╝     ██║   ██║╚════██║
+        ██║  ██╗███████╗███████╗██║         ╚██████╔╝███████║
+        ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝          ╚═════╝ ╚══════╝
+
+LOGO
+        printf '\033[0m'
+        printf '\033[90m'
+        printf '                    AI-First Operating System\n'
+        printf '\033[0m\n'
+        printf '\033[90m                         starting...\033[0m\n'
+        ;;
+    stop)
+        ;;
+esac
+
+exit 0

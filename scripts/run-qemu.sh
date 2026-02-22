@@ -36,20 +36,12 @@ if [ -z "${QEMU}" ]; then
     exit 1
 fi
 
-echo "=========================================="
-echo " Kelp OS — QEMU Boot"
-echo "=========================================="
-echo ""
-echo " Kernel:  ${BZIMAGE}"
-echo " RootFS:  ${ROOTFS}"
-echo ""
-echo " Port forwarding:"
-echo "   localhost:3000 -> guest:3000 (API)"
-echo "   localhost:2222 -> guest:22   (SSH)"
-echo ""
-echo " Press Ctrl+A then X to exit QEMU"
-echo "=========================================="
-echo ""
+printf '\033[32m'
+printf '  Kelp OS — QEMU Boot\n'
+printf '\033[0m\n'
+printf '  API:  localhost:3000\n'
+printf '  SSH:  localhost:2222\n'
+printf '  Exit: Ctrl+A then X\n\n'
 
 # Create a writable copy of rootfs
 ROOTFS_WORK="/tmp/kelp-rootfs.ext4"
@@ -68,7 +60,7 @@ exec ${QEMU} \
     -smp 2 \
     -kernel "${BZIMAGE}" \
     -drive "file=${ROOTFS_WORK},format=raw,if=virtio" \
-    -append "root=/dev/vda rw console=ttyS0" \
+    -append "root=/dev/vda rw console=ttyS0 quiet loglevel=3 vt.global_cursor_default=0" \
     -netdev user,id=net0,hostfwd=tcp::3000-:3000,hostfwd=tcp::2222-:22 \
     -device virtio-net-pci,netdev=net0 \
     -nographic

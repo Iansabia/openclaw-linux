@@ -2,7 +2,7 @@
 #
 # S99kelp — Kelp OS init script
 #
-# Loads the kelp kernel module and starts the gateway daemon.
+# Silent boot: loads kernel module, starts gateway, no verbose output.
 #
 
 DAEMON=/usr/bin/kelp-gateway
@@ -13,61 +13,37 @@ LOGFILE=/var/log/kelp/kelp-gateway.log
 
 case "$1" in
     start)
-        echo "Starting Kelp OS..."
+        # Create directories
+        mkdir -p /var/log/kelp /var/run
 
-        # Create log directory
-        mkdir -p /var/log/kelp
-
-        # Load kernel module
-        if ! lsmod | grep -q "^${MODULE} "; then
-            echo "  Loading kelp.ko..."
-            modprobe ${MODULE} 2>/dev/null || insmod /lib/modules/$(uname -r)/extra/${MODULE}.ko
-            if [ $? -ne 0 ]; then
-                echo "  WARN: Failed to load ${MODULE}.ko"
-            fi
+        # Load kernel module (silent)
+        if ! lsmod 2>/dev/null | grep -q "^${MODULE} "; then
+            modprobe ${MODULE} 2>/dev/null || \
+                insmod /lib/modules/$(uname -r)/extra/${MODULE}.ko 2>/dev/null
         fi
 
-        # Wait for device node
+        # Wait for device node (max 3 seconds)
         TRIES=0
         while [ ! -c ${DEVICE} ] && [ ${TRIES} -lt 30 ]; do
             sleep 0.1
             TRIES=$((TRIES + 1))
         done
 
-        if [ -c ${DEVICE} ]; then
-            echo "  ${DEVICE} ready"
-        else
-            echo "  WARN: ${DEVICE} not available"
-        fi
-
-        # Start gateway daemon
+        # Start gateway daemon (silent)
         if [ -x ${DAEMON} ]; then
-            echo "  Starting kelp-gateway..."
             start-stop-daemon -S -b -m -p ${PIDFILE} \
                 -x ${DAEMON} -- -d >> ${LOGFILE} 2>&1
-            echo "  Gateway listening on port 3000"
-        else
-            echo "  WARN: ${DAEMON} not found"
         fi
-
-        echo "Kelp OS started."
         ;;
 
     stop)
-        echo "Stopping Kelp OS..."
-
-        # Stop gateway
         if [ -f ${PIDFILE} ]; then
-            start-stop-daemon -K -p ${PIDFILE}
+            start-stop-daemon -K -p ${PIDFILE} 2>/dev/null
             rm -f ${PIDFILE}
         fi
-
-        # Unload module
-        if lsmod | grep -q "^${MODULE} "; then
-            rmmod ${MODULE}
+        if lsmod 2>/dev/null | grep -q "^${MODULE} "; then
+            rmmod ${MODULE} 2>/dev/null
         fi
-
-        echo "Kelp OS stopped."
         ;;
 
     restart)
@@ -78,18 +54,15 @@ case "$1" in
 
     status)
         if [ -f ${PIDFILE} ] && kill -0 $(cat ${PIDFILE}) 2>/dev/null; then
-            echo "kelp-gateway is running (PID $(cat ${PIDFILE}))"
+            echo "kelp-gateway running (PID $(cat ${PIDFILE}))"
         else
-            echo "kelp-gateway is not running"
+            echo "kelp-gateway stopped"
         fi
-
-        if lsmod | grep -q "^${MODULE} "; then
-            echo "kelp.ko is loaded"
-            if [ -f /proc/kelp/stats ]; then
-                cat /proc/kelp/stats
-            fi
+        if lsmod 2>/dev/null | grep -q "^${MODULE} "; then
+            echo "kelp.ko loaded"
+            [ -f /proc/kelp/stats ] && cat /proc/kelp/stats
         else
-            echo "kelp.ko is not loaded"
+            echo "kelp.ko not loaded"
         fi
         ;;
 

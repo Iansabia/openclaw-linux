@@ -51,12 +51,12 @@ make -j$(nproc)
 ### Boot in QEMU
 
 ```bash
-qemu-system-x86_64 \
-  -kernel buildroot/output/images/bzImage \
-  -drive file=buildroot/output/images/rootfs.ext2,format=raw \
-  -append "root=/dev/sda console=ttyS0" \
-  -nographic -m 512M
+make qemu
+# or manually:
+scripts/run-qemu.sh
 ```
+
+The OS boots silently, loads the kernel module, starts the gateway, and drops you into an interactive AI chat TUI. The gateway API is accessible at `http://localhost:3000` from the host.
 
 ### Ecosystem (Gateway + CLI + Apps)
 

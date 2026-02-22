@@ -1,4 +1,7 @@
-# /etc/inittab — Kelp OS BusyBox init configuration
+# /etc/inittab — Kelp OS init configuration
+#
+# Boot flow: silent init → kernel module → gateway → TUI
+# Shell available on tty2 (Alt+F2) and serial console
 
 # Startup
 ::sysinit:/bin/mount -t proc proc /proc
@@ -12,14 +15,14 @@ null::sysinit:/bin/ln -sf /proc/self/fd/1 /dev/stdout
 null::sysinit:/bin/ln -sf /proc/self/fd/2 /dev/stderr
 ::sysinit:/bin/hostname -F /etc/hostname
 
-# Init scripts
+# Init scripts (loads kernel module, starts gateway)
 ::sysinit:/etc/init.d/rcS
 
-# Serial console
-::respawn:/sbin/getty -L console 0 vt100
+# Primary console: launch Kelp TUI
+::respawn:/usr/bin/kelp-tui
 
-# TTY1
-tty1::respawn:/sbin/getty 38400 tty1
+# Backup shell on tty2 (Alt+F2 on real hardware)
+tty2::respawn:/sbin/getty 38400 tty2
 
 # Shutdown
 ::shutdown:/etc/init.d/rcK

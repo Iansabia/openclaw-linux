@@ -1,11 +1,8 @@
 /*
- * kelp-linux :: kelp-tui
- * main.c - ncurses-based TUI for interactive chat
+ * kelp-tui — Kelp OS Terminal Interface
  *
- * Usage: kelp-tui [options]
- * Options:
- *   -c, --config <path>   Config file
- *   -h, --help            Help
+ * Split-pane TUI: chat on left, live system metrics on right.
+ * Streaming responses, modern color palette, status bar.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -32,18 +29,21 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/utsname.h>
 
 #include <ncurses.h>
 
 /* ---- Constants ---------------------------------------------------------- */
 
-#define KELP_TUI_VERSION "0.1.0"
+#define KELP_TUI_VERSION "1.0.0"
 
 #define INPUT_HEIGHT       3
 #define STATUS_HEIGHT      1
+#define HEADER_HEIGHT      3
 #define MAX_INPUT_LEN      4096
-#define MAX_HISTORY_LINES  10000
 #define MAX_MESSAGES       2048
+#define METRICS_WIDTH      32
+#define METRICS_REFRESH_MS 1000
 
 /* ---- Color pairs -------------------------------------------------------- */
 
@@ -51,12 +51,23 @@ enum {
     CP_DEFAULT = 0,
     CP_USER,
     CP_ASSISTANT,
-    CP_SYSTEM,
+    CP_SYSTEM_MSG,
     CP_ERROR,
     CP_CODE,
     CP_STATUS_BAR,
     CP_INPUT_BORDER,
-    CP_HIGHLIGHT
+    CP_HIGHLIGHT,
+    CP_HEADER,
+    CP_HEADER_ACCENT,
+    CP_METRICS_TITLE,
+    CP_METRICS_LABEL,
+    CP_METRICS_VALUE,
+    CP_METRICS_GOOD,
+    CP_METRICS_BORDER,
+    CP_DIM,
+    CP_THINKING,
+    CP_SEPARATOR,
+    CP_INPUT_PROMPT
 };
 
 /* ---- Message types ------------------------------------------------------ */
@@ -68,35 +79,61 @@ typedef enum {
     MSG_ERROR
 } msg_type_t;
 
-/* ---- Chat message ------------------------------------------------------- */
-
 typedef struct {
     msg_type_t  type;
     char       *text;
     time_t      timestamp;
 } chat_message_t;
 
+/* ---- Kernel metrics ----------------------------------------------------- */
+
+typedef struct {
+    /* /proc/kelp/stats */
+    long messages_processed;
+    long bytes_read;
+    long bytes_written;
+    int  active_sessions;
+    long uptime_sec;
+
+    /* /proc/kelp/scheduler */
+    int  queue_depth;
+    long total_submitted;
+    long total_completed;
+
+    /* /proc/kelp/accelerators */
+    int  accel_count;
+
+    /* System */
+    long mem_total_kb;
+    long mem_free_kb;
+    double load_avg;
+    char kernel_version[64];
+
+    bool available;
+} kelp_metrics_t;
+
 /* ---- TUI state ---------------------------------------------------------- */
 
 typedef struct {
-    /* Configuration. */
     kelp_config_t cfg;
 
     /* ncurses windows. */
-    WINDOW *win_chat;        /* Scrollable chat history area. */
-    WINDOW *win_input;       /* Input editing area. */
-    WINDOW *win_status;      /* Status bar. */
+    WINDOW *win_header;
+    WINDOW *win_chat;
+    WINDOW *win_metrics;
+    WINDOW *win_input;
+    WINDOW *win_status;
 
-    /* Terminal dimensions. */
     int term_rows;
     int term_cols;
+    bool wide_mode;      /* true if terminal wide enough for metrics pane */
 
     /* Chat history. */
     chat_message_t messages[MAX_MESSAGES];
     int             msg_count;
-    int             scroll_offset;  /* 0 = bottom (most recent). */
+    int             scroll_offset;
 
-    /* Wrapped lines for display (computed on render). */
+    /* Wrapped display lines. */
     char **display_lines;
     int   *display_colors;
     int    display_count;
@@ -105,32 +142,39 @@ typedef struct {
     /* Input buffer. */
     char   input_buf[MAX_INPUT_LEN];
     int    input_len;
-    int    input_pos;       /* Cursor position within input_buf. */
+    int    input_pos;
 
     /* Gateway connection. */
     int    gateway_fd;
     bool   connected;
 
-    /* Status information. */
+    /* Status. */
     char   status_model[128];
     int    total_tokens;
 
-    /* Control flags. */
+    /* Metrics. */
+    kelp_metrics_t metrics;
+    time_t         metrics_last_update;
+
+    /* Control. */
     bool   running;
     bool   needs_redraw;
 
-    /* Async response handling. */
-    bool              waiting;           /* true while waiting for gateway */
-    int               think_frame;       /* animation frame counter */
-    char             *pending_response;  /* response from background thread */
-    bool              response_ready;    /* background thread finished */
-    bool              response_error;    /* response was an error */
+    /* Async response. */
+    bool              waiting;
+    int               think_frame;
+    char             *pending_response;
+    bool              response_ready;
+    bool              response_error;
     pthread_mutex_t   async_lock;
 
     /* Streaming text reveal. */
-    char             *stream_text;       /* full text to reveal gradually */
-    int               stream_pos;        /* characters revealed so far */
-    int               stream_msg_idx;    /* message index being streamed */
+    char             *stream_text;
+    int               stream_pos;
+    int               stream_msg_idx;
+
+    /* Boot time tracking. */
+    time_t            start_time;
 } tui_state_t;
 
 static tui_state_t g_tui;
@@ -141,14 +185,89 @@ static void tui_init(void);
 static void tui_destroy(void);
 static void tui_resize(void);
 static void tui_render(void);
-static void tui_render_chat(void);
-static void tui_render_input(void);
-static void tui_render_status(void);
 static void tui_handle_key(int ch);
 static void tui_add_message(msg_type_t type, const char *text);
 static void tui_send_message(void);
 static int  tui_connect_gateway(void);
 static void tui_rebuild_display_lines(void);
+static void tui_update_metrics(void);
+
+/* ---- Metrics collection ------------------------------------------------- */
+
+static void read_proc_file(const char *path, char *buf, size_t bufsz)
+{
+    buf[0] = '\0';
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    size_t n = fread(buf, 1, bufsz - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+}
+
+static long parse_proc_value(const char *buf, const char *key)
+{
+    const char *p = strstr(buf, key);
+    if (!p) return 0;
+    p += strlen(key);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    return strtol(p, NULL, 10);
+}
+
+static void tui_update_metrics(void)
+{
+    time_t now = time(NULL);
+    if (now - g_tui.metrics_last_update < 1)
+        return;
+    g_tui.metrics_last_update = now;
+
+    kelp_metrics_t *m = &g_tui.metrics;
+    char buf[2048];
+
+    /* Kernel module stats. */
+    read_proc_file("/proc/kelp/stats", buf, sizeof(buf));
+    if (buf[0]) {
+        m->available = true;
+        m->messages_processed = parse_proc_value(buf, "messages_processed");
+        m->bytes_read = parse_proc_value(buf, "bytes_read");
+        m->bytes_written = parse_proc_value(buf, "bytes_written");
+        m->active_sessions = (int)parse_proc_value(buf, "active_sessions");
+        m->uptime_sec = parse_proc_value(buf, "uptime_seconds");
+    }
+
+    /* Scheduler stats. */
+    read_proc_file("/proc/kelp/scheduler", buf, sizeof(buf));
+    if (buf[0]) {
+        m->queue_depth = (int)parse_proc_value(buf, "queue_depth");
+        m->total_submitted = parse_proc_value(buf, "total_submitted");
+        m->total_completed = parse_proc_value(buf, "total_completed");
+    }
+
+    /* Accelerator stats. */
+    read_proc_file("/proc/kelp/accelerators", buf, sizeof(buf));
+    m->accel_count = (int)parse_proc_value(buf, "count");
+
+    /* System memory. */
+    read_proc_file("/proc/meminfo", buf, sizeof(buf));
+    if (buf[0]) {
+        m->mem_total_kb = parse_proc_value(buf, "MemTotal");
+        m->mem_free_kb = parse_proc_value(buf, "MemAvailable");
+        if (m->mem_free_kb == 0)
+            m->mem_free_kb = parse_proc_value(buf, "MemFree");
+    }
+
+    /* Load average. */
+    read_proc_file("/proc/loadavg", buf, sizeof(buf));
+    if (buf[0])
+        m->load_avg = strtod(buf, NULL);
+
+    /* Kernel version (once). */
+    if (!m->kernel_version[0]) {
+        struct utsname uts;
+        if (uname(&uts) == 0)
+            snprintf(m->kernel_version, sizeof(m->kernel_version),
+                     "%s", uts.release);
+    }
+}
 
 /* ---- Gateway communication ---------------------------------------------- */
 
@@ -161,7 +280,6 @@ static int tui_connect_gateway(void)
         default_sock = kelp_paths_socket();
         sock_path = default_sock;
     }
-
     if (!sock_path) {
         tui_add_message(MSG_ERROR, "Cannot determine gateway socket path.");
         return -1;
@@ -180,27 +298,21 @@ static int tui_connect_gateway(void)
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        char errbuf[256];
-        snprintf(errbuf, sizeof(errbuf),
-                 "Cannot connect to gateway at %s: %s",
-                 sock_path, strerror(errno));
-        tui_add_message(MSG_ERROR, errbuf);
-        tui_add_message(MSG_SYSTEM, "Start the gateway with: kelp gateway run");
         close(fd);
         free(default_sock);
+        /* Silent on boot — don't spam errors */
+        g_tui.connected = false;
         return -1;
     }
 
     free(default_sock);
     g_tui.gateway_fd = fd;
     g_tui.connected = true;
-    tui_add_message(MSG_SYSTEM, "Connected to gateway.");
     return 0;
 }
 
 static char *gateway_rpc_call(const char *method, cJSON *params)
 {
-    /* Create a fresh connection per RPC call (server closes after each). */
     const char *sock_path = g_tui.cfg.gateway.socket_path;
     char *default_sock = NULL;
     if (!sock_path) {
@@ -214,11 +326,7 @@ static char *gateway_rpc_call(const char *method, cJSON *params)
     }
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        free(default_sock);
-        g_tui.connected = false;
-        return NULL;
-    }
+    if (fd < 0) { free(default_sock); g_tui.connected = false; return NULL; }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -234,7 +342,6 @@ static char *gateway_rpc_call(const char *method, cJSON *params)
     g_tui.connected = true;
 
     static int rpc_id = 1;
-
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "jsonrpc", "2.0");
     cJSON_AddNumberToObject(req, "id", rpc_id++);
@@ -244,64 +351,39 @@ static char *gateway_rpc_call(const char *method, cJSON *params)
 
     char *payload = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
-    if (!payload) {
-        close(fd);
-        return NULL;
-    }
+    if (!payload) { close(fd); return NULL; }
 
     size_t plen = strlen(payload);
     char *sendbuf = malloc(plen + 2);
-    if (!sendbuf) {
-        free(payload);
-        close(fd);
-        return NULL;
-    }
+    if (!sendbuf) { free(payload); close(fd); return NULL; }
     memcpy(sendbuf, payload, plen);
-    sendbuf[plen]     = '\n';
+    sendbuf[plen] = '\n';
     sendbuf[plen + 1] = '\0';
     free(payload);
 
-    ssize_t total_to_send = (ssize_t)(plen + 1);
-    ssize_t sent = 0;
-    while (sent < total_to_send) {
-        ssize_t n = write(fd, sendbuf + sent,
-                          (size_t)(total_to_send - sent));
-        if (n <= 0) {
-            free(sendbuf);
-            close(fd);
-            g_tui.connected = false;
-            return NULL;
-        }
+    ssize_t sent = 0, total = (ssize_t)(plen + 1);
+    while (sent < total) {
+        ssize_t n = write(fd, sendbuf + sent, (size_t)(total - sent));
+        if (n <= 0) { free(sendbuf); close(fd); g_tui.connected = false; return NULL; }
         sent += n;
     }
     free(sendbuf);
 
-    /* Read response (newline-delimited). */
     kelp_str_t resp = kelp_str_new();
     char buf[4096];
     for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf) - 1);
-        if (n <= 0)
-            break;
+        if (n <= 0) break;
         buf[n] = '\0';
         kelp_str_append(&resp, buf, (size_t)n);
-        if (resp.len > 0 && resp.data[resp.len - 1] == '\n')
-            break;
+        if (resp.len > 0 && resp.data[resp.len - 1] == '\n') break;
     }
-
     close(fd);
 
-    if (resp.len == 0) {
-        kelp_str_free(&resp);
-        g_tui.connected = false;
-        return NULL;
-    }
-
+    if (resp.len == 0) { kelp_str_free(&resp); g_tui.connected = false; return NULL; }
     kelp_str_trim(&resp);
     char *result = resp.data;
     resp.data = NULL;
-    resp.len  = 0;
-    resp.cap  = 0;
     return result;
 }
 
@@ -310,7 +392,6 @@ static char *gateway_rpc_call(const char *method, cJSON *params)
 static void *response_thread_fn(void *arg)
 {
     char *msg_text = (char *)arg;
-
     cJSON *params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "message", msg_text);
     cJSON_AddStringToObject(params, "channel_id", "tui");
@@ -328,23 +409,21 @@ static void *response_thread_fn(void *arg)
         cJSON *resp = kelp_json_parse(resp_str);
         free(resp_str);
         if (!resp) {
-            g_tui.pending_response = strdup("Failed to parse gateway response.");
+            g_tui.pending_response = strdup("Failed to parse response.");
             g_tui.response_error = true;
         } else {
             cJSON *error = cJSON_GetObjectItem(resp, "error");
             if (error) {
                 const char *errmsg = kelp_json_get_string(error, "message");
                 char errbuf[512];
-                snprintf(errbuf, sizeof(errbuf), "Gateway error: %s",
-                         errmsg ? errmsg : "unknown");
+                snprintf(errbuf, sizeof(errbuf), "%s", errmsg ? errmsg : "unknown error");
                 g_tui.pending_response = strdup(errbuf);
                 g_tui.response_error = true;
             } else {
                 cJSON *result_obj = cJSON_GetObjectItem(resp, "result");
                 const char *content = result_obj
                     ? kelp_json_get_string(result_obj, "content") : NULL;
-                g_tui.pending_response = strdup(
-                    content ? content : "Empty response.");
+                g_tui.pending_response = strdup(content ? content : "(empty)");
                 g_tui.response_error = false;
             }
             cJSON_Delete(resp);
@@ -357,21 +436,17 @@ static void *response_thread_fn(void *arg)
 
 static void tui_send_message(void)
 {
-    if (g_tui.input_len == 0 || g_tui.waiting)
-        return;
+    if (g_tui.input_len == 0 || g_tui.waiting) return;
 
-    /* NUL-terminate the input. */
     g_tui.input_buf[g_tui.input_len] = '\0';
     char *msg_text = strdup(g_tui.input_buf);
-    if (!msg_text)
-        return;
+    if (!msg_text) return;
 
-    /* Clear input. */
     g_tui.input_len = 0;
     g_tui.input_pos = 0;
     g_tui.input_buf[0] = '\0';
 
-    /* Handle special commands. */
+    /* Commands. */
     if (strcmp(msg_text, "/quit") == 0 || strcmp(msg_text, "/exit") == 0) {
         g_tui.running = false;
         free(msg_text);
@@ -384,44 +459,21 @@ static void tui_send_message(void)
         free(msg_text);
         return;
     }
-    if (strcmp(msg_text, "/reconnect") == 0) {
-        g_tui.connected = false;
-        tui_connect_gateway();
-        g_tui.needs_redraw = true;
-        free(msg_text);
-        return;
-    }
-    if (strcmp(msg_text, "/help") == 0) {
-        tui_add_message(MSG_SYSTEM, "Commands:");
-        tui_add_message(MSG_SYSTEM, "  /quit, /exit   - Exit");
-        tui_add_message(MSG_SYSTEM, "  /clear         - Clear chat");
-        tui_add_message(MSG_SYSTEM, "  /reconnect     - Reconnect to gateway");
-        tui_add_message(MSG_SYSTEM, "  /help          - Show this help");
-        tui_add_message(MSG_SYSTEM, "Shortcuts:");
-        tui_add_message(MSG_SYSTEM, "  Ctrl-C         - Quit");
-        tui_add_message(MSG_SYSTEM, "  Ctrl-L         - Redraw screen");
-        tui_add_message(MSG_SYSTEM, "  PgUp/PgDn      - Scroll chat history");
-        g_tui.needs_redraw = true;
-        free(msg_text);
-        return;
-    }
 
-    /* Add user message to history. */
     tui_add_message(MSG_USER, msg_text);
     g_tui.needs_redraw = true;
     tui_render();
     doupdate();
 
-    /* Launch async request in background thread. */
     g_tui.waiting = true;
     g_tui.think_frame = 0;
     g_tui.response_ready = false;
     g_tui.response_error = false;
 
     pthread_t tid;
-    if (pthread_create(&tid, NULL, response_thread_fn, msg_text) == 0) {
+    if (pthread_create(&tid, NULL, response_thread_fn, msg_text) == 0)
         pthread_detach(tid);
-    } else {
+    else {
         tui_add_message(MSG_ERROR, "Failed to start response thread.");
         g_tui.waiting = false;
         free(msg_text);
@@ -434,20 +486,16 @@ static void tui_send_message(void)
 static void tui_add_message(msg_type_t type, const char *text)
 {
     if (g_tui.msg_count >= MAX_MESSAGES) {
-        /* Shift messages down, discard oldest. */
         free(g_tui.messages[0].text);
         memmove(&g_tui.messages[0], &g_tui.messages[1],
                 sizeof(chat_message_t) * (MAX_MESSAGES - 1));
         g_tui.msg_count = MAX_MESSAGES - 1;
     }
-
     chat_message_t *msg = &g_tui.messages[g_tui.msg_count];
-    msg->type      = type;
-    msg->text      = strdup(text);
+    msg->type = type;
+    msg->text = strdup(text);
     msg->timestamp = time(NULL);
     g_tui.msg_count++;
-
-    /* Auto-scroll to bottom when new message arrives. */
     g_tui.scroll_offset = 0;
 }
 
@@ -461,31 +509,22 @@ static void tui_display_lines_clear(void)
         free(g_tui.display_lines);
         g_tui.display_lines = NULL;
     }
-    if (g_tui.display_colors) {
-        free(g_tui.display_colors);
-        g_tui.display_colors = NULL;
-    }
+    free(g_tui.display_colors);
+    g_tui.display_colors = NULL;
     g_tui.display_count = 0;
-    g_tui.display_cap   = 0;
+    g_tui.display_cap = 0;
 }
 
-static void tui_display_lines_add(const char *line, int color_pair)
+static void dl_add(const char *line, int cp)
 {
     if (g_tui.display_count >= g_tui.display_cap) {
-        int newcap = g_tui.display_cap == 0 ? 256 : g_tui.display_cap * 2;
-        char **new_lines = realloc(g_tui.display_lines,
-                                   sizeof(char *) * (size_t)newcap);
-        int  *new_colors = realloc(g_tui.display_colors,
-                                   sizeof(int) * (size_t)newcap);
-        if (!new_lines || !new_colors)
-            return;
-        g_tui.display_lines  = new_lines;
-        g_tui.display_colors = new_colors;
-        g_tui.display_cap    = newcap;
+        int nc = g_tui.display_cap == 0 ? 256 : g_tui.display_cap * 2;
+        g_tui.display_lines  = realloc(g_tui.display_lines,  sizeof(char *) * (size_t)nc);
+        g_tui.display_colors = realloc(g_tui.display_colors, sizeof(int) * (size_t)nc);
+        g_tui.display_cap = nc;
     }
-
     g_tui.display_lines[g_tui.display_count]  = strdup(line);
-    g_tui.display_colors[g_tui.display_count] = color_pair;
+    g_tui.display_colors[g_tui.display_count] = cp;
     g_tui.display_count++;
 }
 
@@ -493,150 +532,178 @@ static void tui_rebuild_display_lines(void)
 {
     tui_display_lines_clear();
 
-    int chat_width = g_tui.term_cols - 2; /* Account for border. */
-    if (chat_width < 10)
-        chat_width = 10;
+    int chat_w = g_tui.wide_mode
+        ? g_tui.term_cols - METRICS_WIDTH - 3
+        : g_tui.term_cols - 2;
+    if (chat_w < 20) chat_w = 20;
 
     for (int i = 0; i < g_tui.msg_count; i++) {
         chat_message_t *msg = &g_tui.messages[i];
-
-        /* Determine color pair and prefix. */
         int cp;
         const char *prefix;
+
         switch (msg->type) {
-        case MSG_USER:
-            cp = CP_USER;
-            prefix = "you> ";
-            break;
-        case MSG_ASSISTANT:
-            cp = CP_ASSISTANT;
-            prefix = "assistant> ";
-            break;
-        case MSG_SYSTEM:
-            cp = CP_SYSTEM;
-            prefix = "[system] ";
-            break;
-        case MSG_ERROR:
-            cp = CP_ERROR;
-            prefix = "[error] ";
-            break;
-        default:
-            cp = CP_DEFAULT;
-            prefix = "";
-            break;
+        case MSG_USER:      cp = CP_USER;       prefix = "  > "; break;
+        case MSG_ASSISTANT: cp = CP_ASSISTANT;   prefix = "  "; break;
+        case MSG_SYSTEM:    cp = CP_SYSTEM_MSG;  prefix = "  "; break;
+        case MSG_ERROR:     cp = CP_ERROR;       prefix = "  "; break;
+        default:            cp = CP_DEFAULT;     prefix = "  "; break;
         }
 
-        /* Build the full line with prefix. */
+        /* Label line. */
+        if (msg->type == MSG_USER) {
+            dl_add("  you", CP_DIM);
+        } else if (msg->type == MSG_ASSISTANT) {
+            dl_add("  kelp", CP_HEADER_ACCENT);
+        }
+
         kelp_str_t full = kelp_str_new();
         kelp_str_append_cstr(&full, prefix);
         kelp_str_append_cstr(&full, msg->text);
 
-        /* Word-wrap the full line. */
         const char *p = full.data;
         int remaining = (int)full.len;
-        bool first_line = true;
 
         while (remaining > 0) {
-            int line_len = remaining > chat_width ? chat_width : remaining;
-
-            /* Try to break at a word boundary. */
-            if (line_len < remaining) {
-                int brk = line_len;
-                while (brk > 0 && p[brk] != ' ' && p[brk] != '\n')
-                    brk--;
-                if (brk > 0)
-                    line_len = brk + 1; /* Include the space. */
+            int ll = remaining > chat_w ? chat_w : remaining;
+            if (ll < remaining) {
+                int brk = ll;
+                while (brk > 0 && p[brk] != ' ' && p[brk] != '\n') brk--;
+                if (brk > 0) ll = brk + 1;
             }
-
-            /* Check for embedded newlines. */
-            for (int j = 0; j < line_len; j++) {
-                if (p[j] == '\n') {
-                    line_len = j + 1;
-                    break;
-                }
+            for (int j = 0; j < ll; j++) {
+                if (p[j] == '\n') { ll = j + 1; break; }
             }
+            int cl = ll;
+            while (cl > 0 && (p[cl-1] == '\n' || p[cl-1] == '\r')) cl--;
 
             char tmp[4096];
-            int copy_len = line_len;
-            /* Trim trailing newline/space from display. */
-            while (copy_len > 0 && (p[copy_len - 1] == '\n' || p[copy_len - 1] == '\r'))
-                copy_len--;
+            if (cl >= (int)sizeof(tmp)) cl = (int)sizeof(tmp) - 1;
+            memcpy(tmp, p, (size_t)cl);
+            tmp[cl] = '\0';
 
-            if (copy_len >= (int)sizeof(tmp))
-                copy_len = (int)sizeof(tmp) - 1;
-            memcpy(tmp, p, (size_t)copy_len);
-            tmp[copy_len] = '\0';
+            /* Detect code blocks (lines starting with spaces after prefix or ```) */
+            bool is_code = (strncmp(tmp + strlen(prefix), "```", 3) == 0) ||
+                           (strlen(tmp) > strlen(prefix) + 4 &&
+                            tmp[strlen(prefix)] == ' ' && tmp[strlen(prefix)+1] == ' ' &&
+                            tmp[strlen(prefix)+2] == ' ' && tmp[strlen(prefix)+3] == ' ');
+            dl_add(tmp, is_code ? CP_CODE : cp);
 
-            tui_display_lines_add(tmp, first_line ? cp : cp);
-            first_line = false;
-
-            p += line_len;
-            remaining -= line_len;
+            p += ll;
+            remaining -= ll;
         }
-
         kelp_str_free(&full);
-
-        /* Add an empty line between messages. */
-        tui_display_lines_add("", CP_DEFAULT);
+        dl_add("", CP_DEFAULT);
     }
 }
 
 /* ---- TUI initialization ------------------------------------------------- */
 
-static void tui_init(void)
+static void init_colors(void)
 {
-    /* Set locale for wide character support. */
-    setlocale(LC_ALL, "");
-
-    /* Initialize ncurses. */
-    initscr();
     start_color();
     use_default_colors();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, FALSE);
-    timeout(100); /* 100ms timeout for getch() to allow periodic tasks. */
 
-    /* Define color pairs. */
-    init_pair(CP_USER,         COLOR_GREEN,   -1);
-    init_pair(CP_ASSISTANT,    COLOR_WHITE,   -1);
-    init_pair(CP_SYSTEM,       COLOR_YELLOW,  -1);
-    init_pair(CP_ERROR,        COLOR_RED,     -1);
-    init_pair(CP_CODE,         COLOR_CYAN,    -1);
-    init_pair(CP_STATUS_BAR,   COLOR_BLACK,   COLOR_WHITE);
-    init_pair(CP_INPUT_BORDER, COLOR_BLUE,    -1);
-    init_pair(CP_HIGHLIGHT,    COLOR_BLACK,   COLOR_YELLOW);
+    /* Modern palette — dark background assumed. */
+    if (can_change_color() && COLORS >= 256) {
+        /* Use 256-color palette for richer colors. */
+        init_pair(CP_USER,          COLOR_GREEN,    -1);
+        init_pair(CP_ASSISTANT,     COLOR_WHITE,    -1);
+        init_pair(CP_SYSTEM_MSG,    COLOR_YELLOW,   -1);
+        init_pair(CP_ERROR,         COLOR_RED,      -1);
+        init_pair(CP_CODE,          COLOR_CYAN,     -1);
+        init_pair(CP_STATUS_BAR,    COLOR_BLACK,    COLOR_GREEN);
+        init_pair(CP_INPUT_BORDER,  COLOR_GREEN,    -1);
+        init_pair(CP_HIGHLIGHT,     COLOR_BLACK,    COLOR_YELLOW);
+        init_pair(CP_HEADER,        COLOR_WHITE,    -1);
+        init_pair(CP_HEADER_ACCENT, COLOR_GREEN,    -1);
+        init_pair(CP_METRICS_TITLE, COLOR_GREEN,    -1);
+        init_pair(CP_METRICS_LABEL, COLOR_WHITE,    -1);
+        init_pair(CP_METRICS_VALUE, COLOR_CYAN,     -1);
+        init_pair(CP_METRICS_GOOD,  COLOR_GREEN,    -1);
+        init_pair(CP_METRICS_BORDER,COLOR_GREEN,    -1);
+        init_pair(CP_DIM,           COLOR_WHITE,    -1);
+        init_pair(CP_THINKING,      COLOR_YELLOW,   -1);
+        init_pair(CP_SEPARATOR,     COLOR_GREEN,    -1);
+        init_pair(CP_INPUT_PROMPT,  COLOR_GREEN,    -1);
+    } else {
+        init_pair(CP_USER,          COLOR_GREEN,    -1);
+        init_pair(CP_ASSISTANT,     COLOR_WHITE,    -1);
+        init_pair(CP_SYSTEM_MSG,    COLOR_YELLOW,   -1);
+        init_pair(CP_ERROR,         COLOR_RED,      -1);
+        init_pair(CP_CODE,          COLOR_CYAN,     -1);
+        init_pair(CP_STATUS_BAR,    COLOR_BLACK,    COLOR_GREEN);
+        init_pair(CP_INPUT_BORDER,  COLOR_GREEN,    -1);
+        init_pair(CP_HIGHLIGHT,     COLOR_BLACK,    COLOR_YELLOW);
+        init_pair(CP_HEADER,        COLOR_WHITE,    -1);
+        init_pair(CP_HEADER_ACCENT, COLOR_GREEN,    -1);
+        init_pair(CP_METRICS_TITLE, COLOR_GREEN,    -1);
+        init_pair(CP_METRICS_LABEL, COLOR_WHITE,    -1);
+        init_pair(CP_METRICS_VALUE, COLOR_CYAN,     -1);
+        init_pair(CP_METRICS_GOOD,  COLOR_GREEN,    -1);
+        init_pair(CP_METRICS_BORDER,COLOR_GREEN,    -1);
+        init_pair(CP_DIM,           COLOR_WHITE,    -1);
+        init_pair(CP_THINKING,      COLOR_YELLOW,   -1);
+        init_pair(CP_SEPARATOR,     COLOR_GREEN,    -1);
+        init_pair(CP_INPUT_PROMPT,  COLOR_GREEN,    -1);
+    }
+}
 
-    /* Hide cursor initially. */
-    curs_set(1);
-
-    /* Get terminal dimensions. */
+static void tui_create_windows(void)
+{
     getmaxyx(stdscr, g_tui.term_rows, g_tui.term_cols);
+    g_tui.wide_mode = (g_tui.term_cols >= 100);
 
-    /* Create sub-windows. */
-    int chat_height = g_tui.term_rows - INPUT_HEIGHT - STATUS_HEIGHT;
-    g_tui.win_chat   = newwin(chat_height, g_tui.term_cols, 0, 0);
-    g_tui.win_status = newwin(STATUS_HEIGHT, g_tui.term_cols, chat_height, 0);
-    g_tui.win_input  = newwin(INPUT_HEIGHT, g_tui.term_cols,
-                              chat_height + STATUS_HEIGHT, 0);
+    int chat_width = g_tui.wide_mode
+        ? g_tui.term_cols - METRICS_WIDTH - 1
+        : g_tui.term_cols;
+
+    int body_height = g_tui.term_rows - HEADER_HEIGHT - INPUT_HEIGHT - STATUS_HEIGHT;
+    if (body_height < 3) body_height = 3;
+
+    g_tui.win_header  = newwin(HEADER_HEIGHT, g_tui.term_cols, 0, 0);
+    g_tui.win_chat    = newwin(body_height, chat_width, HEADER_HEIGHT, 0);
+    g_tui.win_status  = newwin(STATUS_HEIGHT, g_tui.term_cols,
+                               HEADER_HEIGHT + body_height, 0);
+    g_tui.win_input   = newwin(INPUT_HEIGHT, g_tui.term_cols,
+                               HEADER_HEIGHT + body_height + STATUS_HEIGHT, 0);
+
+    if (g_tui.wide_mode)
+        g_tui.win_metrics = newwin(body_height, METRICS_WIDTH,
+                                   HEADER_HEIGHT, chat_width + 1);
+    else
+        g_tui.win_metrics = NULL;
 
     scrollok(g_tui.win_chat, TRUE);
     keypad(g_tui.win_input, TRUE);
+}
 
-    /* Initialize state. */
-    g_tui.running      = true;
-    g_tui.needs_redraw = true;
-    g_tui.gateway_fd   = -1;
-    g_tui.connected    = false;
-    g_tui.msg_count    = 0;
+static void tui_init(void)
+{
+    setlocale(LC_ALL, "");
+    initscr();
+    init_colors();
+    cbreak();
+    noecho();
+    keypad(stdscr, TRUE);
+    timeout(50);
+    curs_set(1);
+
+    tui_create_windows();
+
+    g_tui.running       = true;
+    g_tui.needs_redraw  = true;
+    g_tui.gateway_fd    = -1;
+    g_tui.connected     = false;
+    g_tui.msg_count     = 0;
     g_tui.scroll_offset = 0;
-    g_tui.input_len    = 0;
-    g_tui.input_pos    = 0;
-    g_tui.input_buf[0] = '\0';
-    g_tui.total_tokens = 0;
+    g_tui.input_len     = 0;
+    g_tui.input_pos     = 0;
+    g_tui.input_buf[0]  = '\0';
+    g_tui.total_tokens  = 0;
+    g_tui.start_time    = time(NULL);
+    g_tui.metrics_last_update = 0;
 
-    /* Async state. */
     g_tui.waiting          = false;
     g_tui.response_ready   = false;
     g_tui.pending_response = NULL;
@@ -647,155 +714,258 @@ static void tui_init(void)
              g_tui.cfg.model.default_model ? g_tui.cfg.model.default_model
                                            : "claude-sonnet-4-20250514");
 
-    /* Welcome message. */
-    tui_add_message(MSG_SYSTEM,
-                    "Welcome to kelp TUI " KELP_TUI_VERSION);
-    tui_add_message(MSG_SYSTEM,
-                    "Type your message and press Enter. "
-                    "Type /help for commands.");
+    memset(&g_tui.metrics, 0, sizeof(g_tui.metrics));
 }
 
 static void tui_destroy(void)
 {
-    /* Free messages. */
     for (int i = 0; i < g_tui.msg_count; i++)
         free(g_tui.messages[i].text);
-
     tui_display_lines_clear();
-
-    /* Clean up async state. */
     pthread_mutex_destroy(&g_tui.async_lock);
     free(g_tui.pending_response);
     free(g_tui.stream_text);
 
-    /* Clean up ncurses. */
-    if (g_tui.win_chat)
-        delwin(g_tui.win_chat);
-    if (g_tui.win_input)
-        delwin(g_tui.win_input);
-    if (g_tui.win_status)
-        delwin(g_tui.win_status);
-
+    if (g_tui.win_header)  delwin(g_tui.win_header);
+    if (g_tui.win_chat)    delwin(g_tui.win_chat);
+    if (g_tui.win_metrics) delwin(g_tui.win_metrics);
+    if (g_tui.win_input)   delwin(g_tui.win_input);
+    if (g_tui.win_status)  delwin(g_tui.win_status);
     endwin();
 
-    /* Close gateway connection. */
-    if (g_tui.gateway_fd >= 0) {
-        close(g_tui.gateway_fd);
-        g_tui.gateway_fd = -1;
-    }
+    if (g_tui.gateway_fd >= 0) close(g_tui.gateway_fd);
 }
 
-/* ---- Terminal resize ---------------------------------------------------- */
+/* ---- Resize ------------------------------------------------------------- */
 
 static void tui_resize(void)
 {
     endwin();
     refresh();
-    getmaxyx(stdscr, g_tui.term_rows, g_tui.term_cols);
 
-    int chat_height = g_tui.term_rows - INPUT_HEIGHT - STATUS_HEIGHT;
-    if (chat_height < 1)
-        chat_height = 1;
+    if (g_tui.win_header)  delwin(g_tui.win_header);
+    if (g_tui.win_chat)    delwin(g_tui.win_chat);
+    if (g_tui.win_metrics) delwin(g_tui.win_metrics);
+    if (g_tui.win_input)   delwin(g_tui.win_input);
+    if (g_tui.win_status)  delwin(g_tui.win_status);
+    g_tui.win_metrics = NULL;
 
-    /* Resize and reposition windows. */
-    wresize(g_tui.win_chat, chat_height, g_tui.term_cols);
-    mvwin(g_tui.win_chat, 0, 0);
-
-    wresize(g_tui.win_status, STATUS_HEIGHT, g_tui.term_cols);
-    mvwin(g_tui.win_status, chat_height, 0);
-
-    wresize(g_tui.win_input, INPUT_HEIGHT, g_tui.term_cols);
-    mvwin(g_tui.win_input, chat_height + STATUS_HEIGHT, 0);
-
+    tui_create_windows();
     g_tui.needs_redraw = true;
 }
 
 /* ---- Rendering ---------------------------------------------------------- */
 
+static void tui_render_header(void)
+{
+    werase(g_tui.win_header);
+
+    /* Logo line. */
+    wattron(g_tui.win_header, COLOR_PAIR(CP_HEADER_ACCENT) | A_BOLD);
+    mvwprintw(g_tui.win_header, 0, 2, "KELP OS");
+    wattroff(g_tui.win_header, A_BOLD);
+    wattron(g_tui.win_header, COLOR_PAIR(CP_DIM));
+    wprintw(g_tui.win_header, "  v1.0.0");
+    wattroff(g_tui.win_header, COLOR_PAIR(CP_DIM));
+
+    /* Right-aligned info. */
+    if (g_tui.metrics.available) {
+        char uptime[32];
+        long up = g_tui.metrics.uptime_sec;
+        if (up > 3600)
+            snprintf(uptime, sizeof(uptime), "%ldh%02ldm", up/3600, (up%3600)/60);
+        else if (up > 60)
+            snprintf(uptime, sizeof(uptime), "%ldm%02lds", up/60, up%60);
+        else
+            snprintf(uptime, sizeof(uptime), "%lds", up);
+
+        char info[64];
+        snprintf(info, sizeof(info), "uptime %s", uptime);
+        wattron(g_tui.win_header, COLOR_PAIR(CP_DIM));
+        mvwprintw(g_tui.win_header, 0, g_tui.term_cols - (int)strlen(info) - 2, "%s", info);
+        wattroff(g_tui.win_header, COLOR_PAIR(CP_DIM));
+    }
+
+    /* Separator line. */
+    wattron(g_tui.win_header, COLOR_PAIR(CP_SEPARATOR));
+    wmove(g_tui.win_header, 2, 0);
+    for (int i = 0; i < g_tui.term_cols; i++)
+        waddch(g_tui.win_header, ACS_HLINE);
+    wattroff(g_tui.win_header, COLOR_PAIR(CP_SEPARATOR));
+
+    wnoutrefresh(g_tui.win_header);
+}
+
 static void tui_render_chat(void)
 {
     werase(g_tui.win_chat);
-
     tui_rebuild_display_lines();
 
-    int chat_height = g_tui.term_rows - INPUT_HEIGHT - STATUS_HEIGHT;
-    if (chat_height < 1)
-        chat_height = 1;
+    int body_height = g_tui.term_rows - HEADER_HEIGHT - INPUT_HEIGHT - STATUS_HEIGHT;
+    if (body_height < 1) body_height = 1;
 
-    /* Calculate the starting line based on scroll offset. */
-    int total_lines = g_tui.display_count;
-    int start_line  = total_lines - chat_height - g_tui.scroll_offset;
-    if (start_line < 0)
-        start_line = 0;
+    int total = g_tui.display_count;
+    int start = total - body_height - g_tui.scroll_offset;
+    if (start < 0) start = 0;
 
     int row = 0;
-    for (int i = start_line; i < total_lines && row < chat_height; i++, row++) {
-        if (g_tui.display_colors[i] != CP_DEFAULT)
-            wattron(g_tui.win_chat, COLOR_PAIR(g_tui.display_colors[i]));
-
-        /* Bold for user messages. */
-        if (g_tui.display_colors[i] == CP_USER)
+    for (int i = start; i < total && row < body_height; i++, row++) {
+        int cp = g_tui.display_colors[i];
+        if (cp != CP_DEFAULT)
+            wattron(g_tui.win_chat, COLOR_PAIR(cp));
+        if (cp == CP_USER)
             wattron(g_tui.win_chat, A_BOLD);
+        if (cp == CP_DIM)
+            wattron(g_tui.win_chat, A_DIM);
+        if (cp == CP_CODE)
+            wattron(g_tui.win_chat, A_DIM);
 
-        mvwprintw(g_tui.win_chat, row, 1, "%s", g_tui.display_lines[i]);
+        mvwprintw(g_tui.win_chat, row, 0, "%s", g_tui.display_lines[i]);
 
-        if (g_tui.display_colors[i] == CP_USER)
-            wattroff(g_tui.win_chat, A_BOLD);
-        if (g_tui.display_colors[i] != CP_DEFAULT)
-            wattroff(g_tui.win_chat, COLOR_PAIR(g_tui.display_colors[i]));
+        if (cp == CP_CODE)   wattroff(g_tui.win_chat, A_DIM);
+        if (cp == CP_DIM)    wattroff(g_tui.win_chat, A_DIM);
+        if (cp == CP_USER)   wattroff(g_tui.win_chat, A_BOLD);
+        if (cp != CP_DEFAULT) wattroff(g_tui.win_chat, COLOR_PAIR(cp));
     }
 
-    /* Scroll indicator. */
-    if (g_tui.scroll_offset > 0) {
-        wattron(g_tui.win_chat, COLOR_PAIR(CP_HIGHLIGHT) | A_BOLD);
-        mvwprintw(g_tui.win_chat, 0, g_tui.term_cols - 14, " SCROLLED ^%d ",
-                  g_tui.scroll_offset);
-        wattroff(g_tui.win_chat, COLOR_PAIR(CP_HIGHLIGHT) | A_BOLD);
+    /* Thinking animation at bottom. */
+    if (g_tui.waiting && !g_tui.stream_text) {
+        const char *frames[] = {
+            "  thinking    ",
+            "  thinking .  ",
+            "  thinking .. ",
+            "  thinking ...",
+        };
+        int fi = (g_tui.think_frame / 6) % 4;
+        wattron(g_tui.win_chat, COLOR_PAIR(CP_THINKING) | A_DIM);
+        mvwprintw(g_tui.win_chat, body_height - 1, 0, "%s", frames[fi]);
+        wattroff(g_tui.win_chat, COLOR_PAIR(CP_THINKING) | A_DIM);
     }
 
     wnoutrefresh(g_tui.win_chat);
+}
+
+static void metrics_line(WINDOW *w, int row, const char *label, const char *value, int vcp)
+{
+    wattron(w, COLOR_PAIR(CP_METRICS_LABEL) | A_DIM);
+    mvwprintw(w, row, 1, "%-16s", label);
+    wattroff(w, COLOR_PAIR(CP_METRICS_LABEL) | A_DIM);
+    wattron(w, COLOR_PAIR(vcp));
+    wprintw(w, "%s", value);
+    wattroff(w, COLOR_PAIR(vcp));
+}
+
+static void tui_render_metrics(void)
+{
+    if (!g_tui.win_metrics) return;
+
+    werase(g_tui.win_metrics);
+    kelp_metrics_t *m = &g_tui.metrics;
+
+    int body_height = g_tui.term_rows - HEADER_HEIGHT - INPUT_HEIGHT - STATUS_HEIGHT;
+
+    /* Border. */
+    wattron(g_tui.win_metrics, COLOR_PAIR(CP_METRICS_BORDER));
+    for (int i = 0; i < body_height; i++)
+        mvwaddch(g_tui.win_metrics, i, 0, ACS_VLINE);
+    wattroff(g_tui.win_metrics, COLOR_PAIR(CP_METRICS_BORDER));
+
+    int row = 1;
+
+    /* Kernel section. */
+    wattron(g_tui.win_metrics, COLOR_PAIR(CP_METRICS_TITLE) | A_BOLD);
+    mvwprintw(g_tui.win_metrics, row++, 2, "/dev/kelp");
+    wattroff(g_tui.win_metrics, COLOR_PAIR(CP_METRICS_TITLE) | A_BOLD);
+    row++;
+
+    if (m->available) {
+        char val[32];
+        snprintf(val, sizeof(val), "%ld", m->messages_processed);
+        metrics_line(g_tui.win_metrics, row++, "messages", val, CP_METRICS_VALUE);
+
+        snprintf(val, sizeof(val), "%d", m->active_sessions);
+        metrics_line(g_tui.win_metrics, row++, "sessions", val, CP_METRICS_VALUE);
+        row++;
+
+        /* Scheduler section. */
+        wattron(g_tui.win_metrics, COLOR_PAIR(CP_METRICS_TITLE) | A_BOLD);
+        mvwprintw(g_tui.win_metrics, row++, 2, "ai scheduler");
+        wattroff(g_tui.win_metrics, COLOR_PAIR(CP_METRICS_TITLE) | A_BOLD);
+        row++;
+
+        snprintf(val, sizeof(val), "%d", m->queue_depth);
+        metrics_line(g_tui.win_metrics, row++, "queue depth", val,
+                     m->queue_depth > 0 ? CP_THINKING : CP_METRICS_GOOD);
+
+        snprintf(val, sizeof(val), "%ld", m->total_submitted);
+        metrics_line(g_tui.win_metrics, row++, "submitted", val, CP_METRICS_VALUE);
+
+        snprintf(val, sizeof(val), "%ld", m->total_completed);
+        metrics_line(g_tui.win_metrics, row++, "completed", val, CP_METRICS_GOOD);
+    } else {
+        wattron(g_tui.win_metrics, COLOR_PAIR(CP_DIM) | A_DIM);
+        mvwprintw(g_tui.win_metrics, row++, 2, "module not loaded");
+        wattroff(g_tui.win_metrics, COLOR_PAIR(CP_DIM) | A_DIM);
+    }
+
+    row += 2;
+
+    /* System section. */
+    wattron(g_tui.win_metrics, COLOR_PAIR(CP_METRICS_TITLE) | A_BOLD);
+    mvwprintw(g_tui.win_metrics, row++, 2, "system");
+    wattroff(g_tui.win_metrics, COLOR_PAIR(CP_METRICS_TITLE) | A_BOLD);
+    row++;
+
+    if (m->mem_total_kb > 0) {
+        char val[32];
+        long used = m->mem_total_kb - m->mem_free_kb;
+        snprintf(val, sizeof(val), "%ldM / %ldM",
+                 used / 1024, m->mem_total_kb / 1024);
+        metrics_line(g_tui.win_metrics, row++, "memory", val, CP_METRICS_VALUE);
+    }
+
+    {
+        char val[32];
+        snprintf(val, sizeof(val), "%.2f", m->load_avg);
+        metrics_line(g_tui.win_metrics, row++, "load", val, CP_METRICS_VALUE);
+    }
+
+    if (m->kernel_version[0]) {
+        /* Truncate kernel version to fit. */
+        char kv[20];
+        snprintf(kv, sizeof(kv), "%s", m->kernel_version);
+        metrics_line(g_tui.win_metrics, row++, "kernel", kv, CP_DIM);
+    }
+
+    wnoutrefresh(g_tui.win_metrics);
 }
 
 static void tui_render_status(void)
 {
     werase(g_tui.win_status);
     wattron(g_tui.win_status, COLOR_PAIR(CP_STATUS_BAR));
-
-    /* Fill the entire line with spaces for the background. */
     for (int i = 0; i < g_tui.term_cols; i++)
         mvwaddch(g_tui.win_status, 0, i, ' ');
 
-    /* Left side: connection status / thinking animation. */
-    if (g_tui.waiting) {
-        const char *dots[] = {"   ", ".  ", ".. ", "..."};
-        int dot_idx = (g_tui.think_frame / 4) % 4;
+    /* Left: connection. */
+    if (g_tui.connected) {
         wattron(g_tui.win_status, A_BOLD);
-        mvwprintw(g_tui.win_status, 0, 1, " thinking%s ", dots[dot_idx]);
+        mvwprintw(g_tui.win_status, 0, 1, " CONNECTED ");
         wattroff(g_tui.win_status, A_BOLD);
-    } else if (g_tui.stream_text) {
-        wattron(g_tui.win_status, A_BOLD);
-        mvwprintw(g_tui.win_status, 0, 1, " streaming... ");
-        wattroff(g_tui.win_status, A_BOLD);
-    } else if (g_tui.connected) {
-        mvwprintw(g_tui.win_status, 0, 1, " [connected] ");
     } else {
-        mvwprintw(g_tui.win_status, 0, 1, " [disconnected] ");
+        mvwprintw(g_tui.win_status, 0, 1, " OFFLINE ");
     }
 
-    /* Center: model name. */
-    int model_len = (int)strlen(g_tui.status_model);
-    int center_pos = (g_tui.term_cols - model_len) / 2;
-    if (center_pos < 20)
-        center_pos = 20;
-    mvwprintw(g_tui.win_status, 0, center_pos, "%s", g_tui.status_model);
+    /* Center: model. */
+    int ml = (int)strlen(g_tui.status_model);
+    int cp = (g_tui.term_cols - ml) / 2;
+    if (cp < 15) cp = 15;
+    mvwprintw(g_tui.win_status, 0, cp, "%s", g_tui.status_model);
 
-    /* Right side: message count and tokens. */
-    char right_info[64];
-    snprintf(right_info, sizeof(right_info), "msgs:%d tokens:%d ",
-             g_tui.msg_count, g_tui.total_tokens);
-    int right_pos = g_tui.term_cols - (int)strlen(right_info) - 1;
-    if (right_pos > center_pos + model_len + 2)
-        mvwprintw(g_tui.win_status, 0, right_pos, "%s", right_info);
+    /* Right: message count. */
+    char ri[32];
+    snprintf(ri, sizeof(ri), "%d msgs ", g_tui.msg_count);
+    mvwprintw(g_tui.win_status, 0, g_tui.term_cols - (int)strlen(ri) - 1, "%s", ri);
 
     wattroff(g_tui.win_status, COLOR_PAIR(CP_STATUS_BAR));
     wnoutrefresh(g_tui.win_status);
@@ -805,43 +975,38 @@ static void tui_render_input(void)
 {
     werase(g_tui.win_input);
 
-    /* Draw border. */
+    /* Border. */
     wattron(g_tui.win_input, COLOR_PAIR(CP_INPUT_BORDER));
     box(g_tui.win_input, 0, 0);
     wattroff(g_tui.win_input, COLOR_PAIR(CP_INPUT_BORDER));
 
-    /* Prompt label. */
-    wattron(g_tui.win_input, COLOR_PAIR(CP_USER) | A_BOLD);
-    mvwprintw(g_tui.win_input, 1, 1, "> ");
-    wattroff(g_tui.win_input, COLOR_PAIR(CP_USER) | A_BOLD);
+    /* Prompt. */
+    wattron(g_tui.win_input, COLOR_PAIR(CP_INPUT_PROMPT) | A_BOLD);
+    mvwprintw(g_tui.win_input, 1, 2, ">");
+    wattroff(g_tui.win_input, COLOR_PAIR(CP_INPUT_PROMPT) | A_BOLD);
 
     /* Input text. */
-    int input_width = g_tui.term_cols - 5; /* borders + prompt. */
-    if (input_width < 1)
-        input_width = 1;
+    int iw = g_tui.term_cols - 6;
+    if (iw < 1) iw = 1;
+    int vs = 0;
+    if (g_tui.input_pos > iw) vs = g_tui.input_pos - iw;
 
-    /* Calculate visible portion of input. */
-    int vis_start = 0;
-    if (g_tui.input_pos > input_width)
-        vis_start = g_tui.input_pos - input_width;
+    for (int i = 0; i < iw && (vs + i) < g_tui.input_len; i++)
+        mvwaddch(g_tui.win_input, 1, 4 + i,
+                 (chtype)(unsigned char)g_tui.input_buf[vs + i]);
 
-    for (int i = 0; i < input_width && (vis_start + i) < g_tui.input_len; i++) {
-        mvwaddch(g_tui.win_input, 1, 3 + i,
-                 (chtype)(unsigned char)g_tui.input_buf[vis_start + i]);
-    }
-
-    /* Position cursor. */
-    int cursor_x = 3 + (g_tui.input_pos - vis_start);
-    if (cursor_x >= g_tui.term_cols - 1)
-        cursor_x = g_tui.term_cols - 2;
-    wmove(g_tui.win_input, 1, cursor_x);
+    int cx = 4 + (g_tui.input_pos - vs);
+    if (cx >= g_tui.term_cols - 1) cx = g_tui.term_cols - 2;
+    wmove(g_tui.win_input, 1, cx);
 
     wnoutrefresh(g_tui.win_input);
 }
 
 static void tui_render(void)
 {
+    tui_render_header();
     tui_render_chat();
+    tui_render_metrics();
     tui_render_status();
     tui_render_input();
     doupdate();
@@ -853,36 +1018,17 @@ static void tui_render(void)
 static void tui_handle_key(int ch)
 {
     switch (ch) {
-    case ERR:
-        /* Timeout, no key pressed. */
-        break;
-
-    case KEY_RESIZE:
-        tui_resize();
-        break;
-
-    /* Ctrl-C: quit. */
-    case 3:
-        g_tui.running = false;
-        break;
-
-    /* Ctrl-L: redraw. */
-    case 12:
+    case ERR: break;
+    case KEY_RESIZE: tui_resize(); break;
+    case 3: g_tui.running = false; break;         /* Ctrl-C */
+    case 12:                                       /* Ctrl-L */
         clearok(curscr, TRUE);
         g_tui.needs_redraw = true;
         break;
-
-    /* Enter: send message. */
-    case '\n':
-    case '\r':
-    case KEY_ENTER:
+    case '\n': case '\r': case KEY_ENTER:
         tui_send_message();
         break;
-
-    /* Backspace. */
-    case KEY_BACKSPACE:
-    case 127:
-    case 8:
+    case KEY_BACKSPACE: case 127: case 8:
         if (g_tui.input_pos > 0) {
             memmove(&g_tui.input_buf[g_tui.input_pos - 1],
                     &g_tui.input_buf[g_tui.input_pos],
@@ -893,8 +1039,6 @@ static void tui_handle_key(int ch)
             g_tui.needs_redraw = true;
         }
         break;
-
-    /* Delete. */
     case KEY_DC:
         if (g_tui.input_pos < g_tui.input_len) {
             memmove(&g_tui.input_buf[g_tui.input_pos],
@@ -905,96 +1049,56 @@ static void tui_handle_key(int ch)
             g_tui.needs_redraw = true;
         }
         break;
-
-    /* Left arrow. */
     case KEY_LEFT:
-        if (g_tui.input_pos > 0) {
-            g_tui.input_pos--;
-            g_tui.needs_redraw = true;
-        }
+        if (g_tui.input_pos > 0) { g_tui.input_pos--; g_tui.needs_redraw = true; }
         break;
-
-    /* Right arrow. */
     case KEY_RIGHT:
-        if (g_tui.input_pos < g_tui.input_len) {
-            g_tui.input_pos++;
-            g_tui.needs_redraw = true;
-        }
+        if (g_tui.input_pos < g_tui.input_len) { g_tui.input_pos++; g_tui.needs_redraw = true; }
         break;
-
-    /* Home. */
-    case KEY_HOME:
-    case 1: /* Ctrl-A */
-        g_tui.input_pos = 0;
-        g_tui.needs_redraw = true;
+    case KEY_HOME: case 1:
+        g_tui.input_pos = 0; g_tui.needs_redraw = true;
         break;
-
-    /* End. */
-    case KEY_END:
-    case 5: /* Ctrl-E */
-        g_tui.input_pos = g_tui.input_len;
-        g_tui.needs_redraw = true;
+    case KEY_END: case 5:
+        g_tui.input_pos = g_tui.input_len; g_tui.needs_redraw = true;
         break;
-
-    /* Ctrl-U: clear input line. */
-    case 21:
-        g_tui.input_len = 0;
-        g_tui.input_pos = 0;
-        g_tui.input_buf[0] = '\0';
-        g_tui.needs_redraw = true;
+    case 21: /* Ctrl-U */
+        g_tui.input_len = 0; g_tui.input_pos = 0;
+        g_tui.input_buf[0] = '\0'; g_tui.needs_redraw = true;
         break;
-
-    /* Ctrl-W: delete word backward. */
-    case 23: {
+    case 23: { /* Ctrl-W */
         if (g_tui.input_pos > 0) {
             int end = g_tui.input_pos;
-            /* Skip trailing spaces. */
-            while (g_tui.input_pos > 0 &&
-                   g_tui.input_buf[g_tui.input_pos - 1] == ' ')
+            while (g_tui.input_pos > 0 && g_tui.input_buf[g_tui.input_pos-1] == ' ')
                 g_tui.input_pos--;
-            /* Delete word. */
-            while (g_tui.input_pos > 0 &&
-                   g_tui.input_buf[g_tui.input_pos - 1] != ' ')
+            while (g_tui.input_pos > 0 && g_tui.input_buf[g_tui.input_pos-1] != ' ')
                 g_tui.input_pos--;
-            int deleted = end - g_tui.input_pos;
-            memmove(&g_tui.input_buf[g_tui.input_pos],
-                    &g_tui.input_buf[end],
+            int del = end - g_tui.input_pos;
+            memmove(&g_tui.input_buf[g_tui.input_pos], &g_tui.input_buf[end],
                     (size_t)(g_tui.input_len - end));
-            g_tui.input_len -= deleted;
+            g_tui.input_len -= del;
             g_tui.input_buf[g_tui.input_len] = '\0';
             g_tui.needs_redraw = true;
         }
         break;
     }
-
-    /* Page Up: scroll chat history up. */
     case KEY_PPAGE: {
-        int chat_height = g_tui.term_rows - INPUT_HEIGHT - STATUS_HEIGHT;
-        g_tui.scroll_offset += chat_height / 2;
-        int max_scroll = g_tui.display_count -
-                         (g_tui.term_rows - INPUT_HEIGHT - STATUS_HEIGHT);
-        if (max_scroll < 0)
-            max_scroll = 0;
-        if (g_tui.scroll_offset > max_scroll)
-            g_tui.scroll_offset = max_scroll;
+        int bh = g_tui.term_rows - HEADER_HEIGHT - INPUT_HEIGHT - STATUS_HEIGHT;
+        g_tui.scroll_offset += bh / 2;
+        int mx = g_tui.display_count - bh;
+        if (mx < 0) mx = 0;
+        if (g_tui.scroll_offset > mx) g_tui.scroll_offset = mx;
         g_tui.needs_redraw = true;
         break;
     }
-
-    /* Page Down: scroll chat history down. */
     case KEY_NPAGE: {
-        int chat_height = g_tui.term_rows - INPUT_HEIGHT - STATUS_HEIGHT;
-        g_tui.scroll_offset -= chat_height / 2;
-        if (g_tui.scroll_offset < 0)
-            g_tui.scroll_offset = 0;
+        int bh = g_tui.term_rows - HEADER_HEIGHT - INPUT_HEIGHT - STATUS_HEIGHT;
+        g_tui.scroll_offset -= bh / 2;
+        if (g_tui.scroll_offset < 0) g_tui.scroll_offset = 0;
         g_tui.needs_redraw = true;
         break;
     }
-
-    /* Regular character input. */
     default:
         if (ch >= 32 && ch < 127 && g_tui.input_len < MAX_INPUT_LEN - 1) {
-            /* Insert at cursor position. */
             memmove(&g_tui.input_buf[g_tui.input_pos + 1],
                     &g_tui.input_buf[g_tui.input_pos],
                     (size_t)(g_tui.input_len - g_tui.input_pos));
@@ -1008,37 +1112,6 @@ static void tui_handle_key(int ch)
     }
 }
 
-/* ---- Usage -------------------------------------------------------------- */
-
-static void usage(void)
-{
-    printf(
-        "Usage: kelp-tui [options]\n"
-        "\n"
-        "Options:\n"
-        "  -c, --config <path>   Configuration file path\n"
-        "  -h, --help            Show this help\n"
-        "\n"
-        "Keyboard shortcuts:\n"
-        "  Enter        Send message\n"
-        "  Ctrl-C       Quit\n"
-        "  Ctrl-L       Redraw screen\n"
-        "  Ctrl-U       Clear input line\n"
-        "  Ctrl-W       Delete word backward\n"
-        "  Ctrl-A       Move to beginning of line\n"
-        "  Ctrl-E       Move to end of line\n"
-        "  Page Up      Scroll chat history up\n"
-        "  Page Down    Scroll chat history down\n"
-        "\n"
-        "Chat commands:\n"
-        "  /quit, /exit   Exit the TUI\n"
-        "  /clear          Clear chat history\n"
-        "  /reconnect      Reconnect to gateway\n"
-        "  /help           Show help\n"
-        "\n"
-    );
-}
-
 /* ---- Main --------------------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -1048,30 +1121,29 @@ int main(int argc, char **argv)
     static struct option long_options[] = {
         {"config", required_argument, NULL, 'c'},
         {"help",   no_argument,       NULL, 'h'},
-        {NULL,     0,                 NULL,  0 }
+        {NULL, 0, NULL, 0}
     };
 
     int opt;
     while ((opt = getopt_long(argc, argv, "c:h", long_options, NULL)) != -1) {
         switch (opt) {
-        case 'c':
-            config_path = optarg;
-            break;
+        case 'c': config_path = optarg; break;
         case 'h':
-            usage();
+            printf("Usage: kelp-tui [options]\n\n"
+                   "Options:\n"
+                   "  -c, --config <path>   Config file\n"
+                   "  -h, --help            Help\n\n"
+                   "Keys: Enter=send, Ctrl-C=quit, PgUp/PgDn=scroll\n");
             return 0;
         default:
-            fprintf(stderr, "Try 'kelp-tui --help' for more information.\n");
             return 1;
         }
     }
 
-    /* Load configuration. */
     memset(&g_tui, 0, sizeof(g_tui));
     if (config_path) {
         if (kelp_config_load(config_path, &g_tui.cfg) != 0) {
-            fprintf(stderr, "kelp-tui: failed to load config: %s\n",
-                    config_path);
+            fprintf(stderr, "kelp-tui: failed to load config: %s\n", config_path);
             return 1;
         }
     } else {
@@ -1079,23 +1151,24 @@ int main(int argc, char **argv)
     }
     kelp_config_merge_env(&g_tui.cfg);
 
-    /* Initialize logging (to file, not stderr, since we own the terminal). */
     kelp_log_init("kelp-tui", KELP_LOG_WARN);
     if (g_tui.cfg.logging.file) {
         FILE *logfp = fopen(g_tui.cfg.logging.file, "a");
-        if (logfp)
-            kelp_log_set_file(logfp);
+        if (logfp) kelp_log_set_file(logfp);
     }
 
-    /* Initialize TUI. */
     tui_init();
 
-    /* Attempt initial gateway connection. */
-    tui_connect_gateway();
+    /* Welcome. */
+    tui_add_message(MSG_SYSTEM, "Kelp OS ready. Type a message to talk to the AI.");
+
+    /* Connect to gateway (silent if not available yet). */
+    if (tui_connect_gateway() == 0)
+        tui_add_message(MSG_SYSTEM, "Gateway connected.");
 
     /* Main loop. */
     while (g_tui.running) {
-        /* Check for async response completion. */
+        /* Async response handling. */
         if (g_tui.waiting) {
             pthread_mutex_lock(&g_tui.async_lock);
             if (g_tui.response_ready) {
@@ -1105,7 +1178,6 @@ int main(int argc, char **argv)
                         tui_add_message(MSG_ERROR, g_tui.pending_response);
                         free(g_tui.pending_response);
                     } else {
-                        /* Start streaming text reveal. */
                         g_tui.stream_text = g_tui.pending_response;
                         g_tui.stream_pos = 0;
                         tui_add_message(MSG_ASSISTANT, "");
@@ -1121,23 +1193,22 @@ int main(int argc, char **argv)
             pthread_mutex_unlock(&g_tui.async_lock);
         }
 
-        /* Handle streaming text reveal (char-by-char effect). */
+        /* Streaming text reveal. */
         if (g_tui.stream_text) {
             int total_len = (int)strlen(g_tui.stream_text);
             int remaining = total_len - g_tui.stream_pos;
             if (remaining > 0) {
-                int advance = 8;
-                if (total_len > 2000) advance = 24;
-                else if (total_len > 1000) advance = 16;
+                int advance = 6;
+                if (total_len > 2000) advance = 20;
+                else if (total_len > 500) advance = 12;
                 if (advance > remaining) advance = remaining;
                 g_tui.stream_pos += advance;
-                /* Update the message text to show revealed portion. */
+
                 chat_message_t *msg = &g_tui.messages[g_tui.stream_msg_idx];
                 free(msg->text);
                 char *partial = malloc((size_t)g_tui.stream_pos + 1);
                 if (partial) {
-                    memcpy(partial, g_tui.stream_text,
-                           (size_t)g_tui.stream_pos);
+                    memcpy(partial, g_tui.stream_text, (size_t)g_tui.stream_pos);
                     partial[g_tui.stream_pos] = '\0';
                     msg->text = partial;
                 } else {
@@ -1146,18 +1217,20 @@ int main(int argc, char **argv)
                 }
                 g_tui.needs_redraw = true;
             } else {
-                /* Streaming complete. */
                 free(g_tui.stream_text);
                 g_tui.stream_text = NULL;
                 g_tui.needs_redraw = true;
             }
         }
 
-        /* Adjust refresh rate: faster during streaming/thinking. */
+        /* Refresh rate. */
         if (g_tui.stream_text || g_tui.waiting)
-            timeout(16);   /* ~60fps for smooth animation. */
+            timeout(16);
         else
-            timeout(100);  /* Normal idle rate. */
+            timeout(100);
+
+        /* Update metrics periodically. */
+        tui_update_metrics();
 
         if (g_tui.needs_redraw)
             tui_render();
@@ -1165,11 +1238,19 @@ int main(int argc, char **argv)
         int ch = getch();
         if (ch != ERR)
             tui_handle_key(ch);
+
+        /* Retry gateway connection if disconnected. */
+        if (!g_tui.connected && !g_tui.waiting) {
+            static time_t last_retry = 0;
+            time_t now = time(NULL);
+            if (now - last_retry >= 5) {
+                last_retry = now;
+                tui_connect_gateway();
+            }
+        }
     }
 
-    /* Clean up. */
     tui_destroy();
     kelp_config_free(&g_tui.cfg);
-
     return 0;
 }
